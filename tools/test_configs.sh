@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Build every core configuration and run, on each:
-#   - perftest (counters and per-configuration misprediction expectations)
+#   - perftest (counters and per-configuration misprediction expectations),
+#     and the M-extension directed test where the core has M
 #   - one CoreMark iteration co-simulated against the reference model
 #   - random co-simulation programs
 # With --bench, also report CoreMark (10 iterations) per configuration.
@@ -13,48 +14,66 @@ BENCH=0; [[ "${2:-}" == "--bench" || "${1:-}" == "--bench" ]] && BENCH=1
 [[ "$SEEDS" == "--bench" ]] && SEEDS=30
 export PYTHONDONTWRITEBYTECODE=1
 
-#        name        EARLY_JAL BPRED BHT_BITS GHR_BITS RAS_DEPTH IBTB_BITS
+# Programs are compiled for each configuration's instruction set
+# (M_EXT 0: rv32i, 1: rv32i_zmmul, 2: rv32im).
+#        name        EARLY_JAL BPRED BHT_BITS GHR_BITS RAS_DEPTH IBTB_BITS M_EXT
 CONFIGS=(
-  "baseline       0 0 8 8 0 0"
-  "early-jal      1 0 8 8 0 0"
-  "btfn           1 1 8 8 0 0"
-  "bimodal        1 2 8 8 0 0"
-  "gshare         1 3 8 8 0 0"
-  "gshare+ras     1 3 8 8 8 0"
-  "gshare+ibtb    1 3 8 8 0 4"
-  "full           1 3 8 8 8 4"
-  "tiny-tables    1 3 2 2 2 1"
+  "baseline       0 0 8 8 0 0 0"
+  "early-jal      1 0 8 8 0 0 0"
+  "btfn           1 1 8 8 0 0 0"
+  "bimodal        1 2 8 8 0 0 0"
+  "gshare         1 3 8 8 0 0 0"
+  "gshare+ras     1 3 8 8 8 0 0"
+  "gshare+ibtb    1 3 8 8 0 4 0"
+  "predict-all    1 3 8 8 8 4 0"
+  "+multiply      1 3 8 8 8 4 1"
+  "+divide (full) 1 3 8 8 8 4 2"
+  "tiny-tables    1 3 2 2 2 1 2"
 )
+MARCHES=(rv32i_zicsr rv32i_zmmul_zicsr rv32im_zicsr)
 
 # Build all configurations in parallel
+objname() { tr ' +()' '_p__' <<<"$1"; }
+mkdir -p "$ROOT/out"
 for c in "${CONFIGS[@]}"; do
-  read -r name ej bp bht ghr ras ib <<<"$c"
-  make -s -C "$ROOT/sim" OBJ="obj_$name" EARLY_JAL=$ej BPRED=$bp BHT_BITS=$bht \
-       GHR_BITS=$ghr RAS_DEPTH=$ras IBTB_BITS=$ib > "$ROOT/out/build_$name.log" 2>&1 &
+  name="${c:0:14}"; read -r ej bp bht ghr ras ib m <<<"${c:15}"
+  o=$(objname "$name")
+  make -s -C "$ROOT/sim" OBJ="obj_$o" EARLY_JAL=$ej BPRED=$bp BHT_BITS=$bht GHR_BITS=$ghr \
+       RAS_DEPTH=$ras IBTB_BITS=$ib M_EXT=$m > "$ROOT/out/build_$o.log" 2>&1 &
 done
-mkdir -p "$ROOT/out"; wait
+wait
 
-make -s -C "$ROOT/sw" PROG=perftest >/dev/null
-make -s -C "$ROOT/sw" PROG=coremark ITERATIONS=1 BUILD=build/cm1 >/dev/null
-cp "$ROOT/sw/build/cm1/coremark.hex" "$ROOT/out/coremark_1iter.hex"
-[[ $BENCH == 1 ]] && make -s -C "$ROOT/sw" PROG=coremark ITERATIONS=10 >/dev/null
+# Programs, once per instruction set
+for ma in "${MARCHES[@]}"; do
+  make -s -C "$ROOT/sw" PROG=perftest MARCH=$ma BUILD=build/$ma >/dev/null
+  make -s -C "$ROOT/sw" PROG=mext MARCH=$ma BUILD=build/$ma >/dev/null 2>&1 || true
+  make -s -C "$ROOT/sw" PROG=coremark ITERATIONS=1 MARCH=$ma BUILD=build/$ma/cm1 >/dev/null
+  cp "$ROOT/sw/build/$ma/cm1/coremark.hex" "$ROOT/out/coremark_1iter_$ma.hex"
+  [[ $BENCH == 1 ]] && make -s -C "$ROOT/sw" PROG=coremark ITERATIONS=10 MARCH=$ma BUILD=build/$ma/cm10 >/dev/null
+done
 
 fails=0
-printf '%-14s %-10s %-10s %-10s' config perftest coremark random
+printf '%-15s %-3s %-9s %-9s %-9s' config M perftest coremark random
 [[ $BENCH == 1 ]] && printf ' %-13s %-6s %-9s %-9s' CoreMark/MHz CPI br-misp jmp-redir
 echo
 for c in "${CONFIGS[@]}"; do
-  read -r name _ <<<"$c"
-  sim="$ROOT/sim/obj_$name/Vrv_soc"
-  if [[ ! -x $sim ]]; then echo "$name: BUILD FAILED"; cat "$ROOT/out/build_$name.log"; fails=$((fails+1)); continue; fi
-  pt=ok;  SIM=$sim "$ROOT/tools/cosim.sh" "$ROOT/sw/build/perftest.hex" >/dev/null 2>&1 || pt=FAIL
+  name="${c:0:14}"; read -r _ _ _ _ _ _ m <<<"${c:15}"
+  o=$(objname "$name"); ma=${MARCHES[$m]}; B="$ROOT/sw/build/$ma"
+  sim="$ROOT/sim/obj_$o/Vrv_soc"
+  if [[ ! -x $sim ]]; then echo "$name: BUILD FAILED"; cat "$ROOT/out/build_$o.log"; fails=$((fails+1)); continue; fi
+  pt=ok;  SIM=$sim "$ROOT/tools/cosim.sh" "$B/perftest.hex" >/dev/null 2>&1 || pt=FAIL
   grep -q "perftest: 0 failures" "$ROOT/out/perftest.rtl.uart" 2>/dev/null || pt=FAIL
-  cm=ok;  SIM=$sim "$ROOT/tools/cosim.sh" "$ROOT/out/coremark_1iter.hex" >/dev/null 2>&1 || cm=FAIL
-  rr=$(SIM=$sim "$ROOT/tools/run_random.sh" "$SEEDS" 7000 | tail -1 | awk '{print $3"/"$3+$5}')
+  if [[ $m -ge 1 ]]; then
+    SIM=$sim "$ROOT/tools/cosim.sh" "$B/mext.hex" >/dev/null 2>&1 || pt=FAIL
+    grep -q " 0 failures" "$ROOT/out/mext.rtl.uart" 2>/dev/null || pt=FAIL
+  fi
+  cm=ok;  SIM=$sim "$ROOT/tools/cosim.sh" "$ROOT/out/coremark_1iter_$ma.hex" >/dev/null 2>&1 || cm=FAIL
+  mflag=""; [[ $m -eq 2 ]] && mflag="--m"
+  rr=$(SIM=$sim "$ROOT/tools/run_random.sh" "$SEEDS" 7000 $mflag | tail -1 | awk '{print $3"/"$3+$5}')
   [[ $pt == ok && $cm == ok && $rr == "$SEEDS/$SEEDS" ]] || fails=$((fails+1))
-  printf '%-14s %-10s %-10s %-10s' "$name" "$pt" "$cm" "$rr"
+  printf '%-15s %-3s %-9s %-9s %-9s' "$name" "$m" "$pt" "$cm" "$rr"
   if [[ $BENCH == 1 ]]; then
-    r=$("$sim" +firmware="$ROOT/sw/build/coremark.hex" 2>/dev/null)
+    r=$("$sim" +firmware="$B/cm10/coremark.hex" 2>/dev/null)
     mhz=$(sed -n 's/^CoreMark\/MHz: //p' <<<"$r")
     cpi=$(sed -n 's/^CPI: *//p' <<<"$r")
     bm=$(sed -n 's/.*mispredicted branches [0-9]* (\(.*\))/\1/p' <<<"$r")

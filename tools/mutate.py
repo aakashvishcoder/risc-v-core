@@ -6,7 +6,8 @@ Each mutant is one realistic hardware bug (a missing forwarding path, a
 missing stall, a predictor that never trains, ...) injected into a *copy* of
 rtl/. The copy is built into its own Verilator model (default configuration)
 and checked two ways:
-  - random co-simulation seeds catch functional bugs (wrong results)
+  - random co-simulation seeds (RV32IM) catch functional bugs (wrong results)
+  - sw/mext checks spec-defined multiply/divide results directly
   - perftest catches performance bugs: the design still computes the right
     answers, so co-simulation can't see them, but event counts are off
 A mutant is "killed" if either check fails. A surviving mutant means a hole
@@ -28,19 +29,19 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # (name, file, original text, mutated text)
 MUTANTS = [
     ("no MEM->EX forwarding", "rv_core.sv",
-     "if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && mem.rd == r)",
+     "if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)",
      "if (1'b0)"),
     ("no WB->EX forwarding", "rv_core.sv",
      "if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)",
      "if (1'b0)"),
     ("forwarding priority reversed (WB before MEM)", "rv_core.sv",
-     """    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && mem.rd == r)
+     """    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)
       return mem.result;
     if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)
       return wb.value;""",
      """    if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)
       return wb.value;
-    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && mem.rd == r)
+    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)
       return mem.result;"""),
     ("forwarding from x0", "rv_core.sv",
      "if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)",
@@ -110,6 +111,34 @@ MUTANTS = [
     ("return-address stack pushes pc, not pc+4", "rv_core.sv",
      "ras[ras_inc] <= pc_d + 32'd4;",
      "ras[ras_inc] <= pc_d;"),
+    # --- M extension: functional ---
+    ("no multiply-use stall", "rv_core.sv",
+     "wire mul_use  = ex.valid && ex.c.is_mul  && ex_dep;",
+     "wire mul_use  = 1'b0 && ex.valid && ex.c.is_mul  && ex_dep;"),
+    ("MULHSU treats rs2 as signed", "rv_core.sv",
+     "wire b_signed = (f3_e[1:0] == 2'b01);",
+     "wire b_signed = (f3_e[1:0] != 2'b11);"),
+    ("MULH* return the low word", "rv_core.sv",
+     "wire [31:0]        mul_val = (mem.funct3[1:0] == 2'b00) ? product[31:0] : product[63:32];",
+     "wire [31:0]        mul_val = product[31:0];"),
+    ("divide doesn't hold EX", "rv_core.sv",
+     "wire ex_stall    = div_pending && !(div_issued && div_done);",
+     "wire ex_stall    = 1'b0;"),
+    ("no MEM bubbles while dividing", "rv_core.sv",
+     "mem.valid   <= ex.valid && !ex_stall;",
+     "mem.valid   <= ex.valid;"),
+    ("divide by zero returns 0", "rv_divider.sv",
+     "result = want_rem ? dividend : 32'hFFFF_FFFF;",
+     "result = want_rem ? dividend : 32'h0;"),
+    ("REM takes the divisor's sign", "rv_divider.sv",
+     "neg_r    <= is_signed && a[31];",
+     "neg_r    <= is_signed && b[31];"),
+    # --- M extension: performance only ---
+    ("divide by zero runs all 32 iterations", "rv_divider.sv",
+     """      busy     <= (b != 32'b0);
+      done     <= (b == 32'b0);   // divide by zero: result is ready now""",
+     """      busy     <= 1'b1;
+      done     <= 1'b0;"""),
 ]
 
 RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_divider.sv", "rv_regfile.sv", "rv_core.sv",
@@ -129,9 +158,11 @@ def main():
     args = ap.parse_args()
 
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    if run(f"make -s -C {ROOT}/sw PROG=perftest").returncode != 0:
-        sys.exit("could not build perftest")
+    for prog in ("perftest", "mext"):
+        if run(f"make -s -C {ROOT}/sw PROG={prog}").returncode != 0:
+            sys.exit(f"could not build {prog}")
     perftest = f"{ROOT}/sw/build/perftest.hex"
+    mext = f"{ROOT}/sw/build/mext.hex"
     killed = 0
     mutants = [m for m in MUTANTS if not args.only or args.only in m[0]]
     for name, fname, old, new in mutants:
@@ -154,16 +185,19 @@ def main():
             if b.returncode != 0:
                 print(f"  ERROR    {name}: build failed\n{b.stdout}{b.stderr}")
                 continue
-            r = run(f"{ROOT}/tools/run_random.sh {args.seeds} {args.first_seed}",
+            r = run(f"{ROOT}/tools/run_random.sh {args.seeds} {args.first_seed} --m",
                     env=dict(env, SIM=f"{obj}/Vrv_soc", KEEP_FAILS="0"))
             summary = r.stdout.strip().splitlines()[-1]
             failed = int(summary.split(",")[1].split()[0])
             p = run(f"{obj}/Vrv_soc +firmware={perftest} +max_cycles=2000000")
             perf_fail = p.returncode != 0 or "perftest: 0 failures" not in p.stdout
-            dead = failed > 0 or perf_fail
+            m = run(f"{obj}/Vrv_soc +firmware={mext} +max_cycles=2000000")
+            mext_fail = m.returncode != 0 or ", 0 failures" not in m.stdout
+            dead = failed > 0 or perf_fail or mext_fail
             killed += dead
-            print(f"  {'KILLED' if dead else 'SURVIVED':8} {name:50} "
-                  f"random {failed:2}/{args.seeds} fail   perftest {'FAIL' if perf_fail else 'pass'}")
+            print(f"  {'KILLED' if dead else 'SURVIVED':8} {name:46} "
+                  f"random {failed:2}/{args.seeds}  perftest {'FAIL' if perf_fail else 'pass'}"
+                  f"  mext {'FAIL' if mext_fail else 'pass'}")
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
