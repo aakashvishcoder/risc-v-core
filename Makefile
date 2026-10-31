@@ -20,7 +20,7 @@ sim:
 hello:
 	$(MAKE) -s -C sw PROG=hello
 
-PROGS = hello perftest mext cachetest memstream
+PROGS = hello perftest mext cachetest coldload memstream
 CACHE_SIM = sim/obj_cache/Vrv_soc
 progs:
 	@for p in $(PROGS); do $(MAKE) -s -C sw PROG=$$p || exit 1; done

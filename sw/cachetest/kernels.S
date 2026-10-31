@@ -113,13 +113,20 @@ ic_loop:
     csrr a0, hpmcounter14
     ret
 
-# ic_measure(passes): start read, then call ic_loop, all from one 16-byte line
-# so no fetch miss can land between the start read and the loop.
-    .balign 16
+# ic_measure(passes): one warm-up pass, then the start read and the measured
+# call from a single 16-byte line, so no fetch miss can land between the
+# start read and the loop. The warm-up happens here rather than in the caller
+# so that no unrelated code (which could evict loop lines in a direct-mapped
+# cache) runs between warming the loop and measuring it.
     .globl ic_measure
 ic_measure:
-    csrr t5, hpmcounter14
     mv   t6, ra
+    mv   t4, a0
+    li   a0, 1
+    jal  ra, ic_loop              # warm-up pass
+    .balign 16
+    csrr t5, hpmcounter14
+    mv   a0, t4
     jal  ra, ic_loop
     nop
     sub  a0, a0, t5

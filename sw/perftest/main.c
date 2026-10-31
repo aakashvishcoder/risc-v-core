@@ -39,6 +39,7 @@ void k6(uint32_t d[NEV]);
 void k7(uint32_t d[NEV]);
 void k8(uint32_t d[NEV]);
 void k9(uint32_t d[NEV]);
+void k10(uint32_t d[NEV]);
 
 // mconfig layout (see rv_core.sv)
 struct cfg { int early_jal, bpred, ras_depth, ibtb_bits, bht_bits, ghr_bits, m_ext; };
@@ -137,7 +138,7 @@ int main(void) {
     {"k5 load to x0",       k5, 4 * N,          0,     N,     N - 1,           0, 0, 0, loop_misp(&c), none},
     {"k6 never taken",      k6, 4 * N,          0,     2 * N, N - 1,           0, 0, 0, radd(loop_misp(&c), never_misp(&c)), none},
     {"k7 alternating",      k7, 5 * N - N / 2,  0,     2 * N, N - 1 + N / 2,   0, 0, 0, radd(loop_misp(&c), alt_misp(&c)), none},
-    // two multiplies per iteration, the first one consumed immediately
+    {"k10 missing loads",   k10, 5 * N,         N,     N,     N - 1,           0, 0, 0, loop_misp(&c), none},
     {"k8 multiply-use",     k8, 6 * N,          0,     2 * N, N - 1,           0, N, 0, radd(loop_misp(&c), never_misp(&c)), none},
     {"k9 divide",           k9, 5 * N,          0,     N,     N - 1,           0, 0, N * (DIV_CYCLES + DIV_ZERO_CYCLES), loop_misp(&c), none},
   };

@@ -236,6 +236,26 @@ k9:
     DIFF
     EPILOGUE
 
+# k10: loads that miss in any data cache up to 6 KB (64-byte stride over
+# 6.4 KB), each used immediately (500 instructions). With caches, every load
+# waits in EX for its miss: those cycles are D-cache stalls, and the load-use
+# stall behind each load must still be counted exactly once.
+    .globl k10
+k10:
+    PROLOGUE
+    la   t1, bigbuf
+    li   t3, N
+    SNAP
+1:  lw   t2, 0(t1)
+    add  t4, t2, t2                   # uses the load right away -> 1 stall
+    addi t1, t1, 64
+    addi t3, t3, -1
+    bnez t3, 1b
+    DIFF
+    EPILOGUE
+
     .bss
     .balign 4
 scratch: .space 16
+    .balign 64
+bigbuf:  .space 6400

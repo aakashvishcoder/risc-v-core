@@ -40,14 +40,22 @@ int main(void) {
 
   // ---- instruction cache: a 16-line loop
   uint32_t passes = 4;
-  ic_measure(1);                                   // warm up
-  uint32_t im = ic_measure(passes);
+  uint32_t im = ic_measure(passes);               // warms up internally
   uint32_t expect_im = ic_lines >= 16 ? 0 : 16 * passes;   // fits, or thrashes every line
   printf_("  %-34s misses %5u (expect %5u)  %s\n", "I: 256-byte loop, 4 warm passes", im,
           expect_im, im == expect_im ? "ok" : "FAIL");
   fails += im != expect_im;
 
   if (has_dcache) {
+    // Read code as data: the first instruction (crt0: li x1, 0 = 0x00000093)
+    // has never been loaded through the D-cache, so this must miss and fetch
+    // it from memory - a cache that hits on a line it never filled (e.g.
+    // ignoring the valid bit) returns garbage here.
+    uint32_t first = *(volatile uint32_t *)0;
+    printf_("  %-34s %08x (expect 00000093)  %s\n", "D: load code word 0 as data", first,
+            first == 0x00000093 ? "ok" : "FAIL");
+    fails += first != 0x00000093;
+
     uint32_t sets = 1u << dc_sets_log2;
     uint32_t lines = sets * ways;                  // lines in the cache
     uint32_t size = lines * 16;                    // bytes

@@ -10,7 +10,8 @@ and checked two ways:
   - sw/mext checks spec-defined multiply/divide results directly
   - perftest catches performance bugs: the design still computes the right
     answers, so co-simulation can't see them, but event counts are off
-  - sw/cachetest checks exact miss/writeback counts and data integrity
+  - sw/cachetest checks exact miss/writeback counts and data integrity, and
+    sw/coldload checks the first loads into a cold data cache
 A mutant is "killed" if any check fails. A surviving mutant means a hole in
 the tests (or an equivalent mutant that doesn't change behavior). Mutants of
 the memory system are built with caches in front of slow main memory.
@@ -198,12 +199,13 @@ def main():
     args = ap.parse_args()
 
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    for prog in ("perftest", "mext", "cachetest"):
+    for prog in ("perftest", "mext", "cachetest", "coldload"):
         if run(f"make -s -C {ROOT}/sw PROG={prog}").returncode != 0:
             sys.exit(f"could not build {prog}")
     perftest = f"{ROOT}/sw/build/perftest.hex"
     mext = f"{ROOT}/sw/build/mext.hex"
     cachetest = f"{ROOT}/sw/build/cachetest.hex"
+    coldload = f"{ROOT}/sw/build/coldload.hex"
     killed = 0
     mutants = [m for m in MUTANTS if not args.only or args.only in m[0]]
     for name, fname, old, new, *cfg in mutants:
@@ -236,7 +238,9 @@ def main():
             m = run(f"{obj}/Vrv_soc +firmware={mext} +max_cycles=2000000")
             mext_fail = m.returncode != 0 or ", 0 failures" not in m.stdout
             c = run(f"{obj}/Vrv_soc +firmware={cachetest} +max_cycles=5000000")
-            cache_fail = c.returncode != 0 or "cachetest: 0 failures" not in c.stdout
+            k = run(f"{obj}/Vrv_soc +firmware={coldload} +max_cycles=1000000")
+            cache_fail = (c.returncode != 0 or "cachetest: 0 failures" not in c.stdout or
+                          k.returncode != 0 or "coldload: 0 failures" not in k.stdout)
             dead = failed > 0 or perf_fail or mext_fail or cache_fail
             killed += dead
             f = lambda x: "FAIL" if x else "pass"

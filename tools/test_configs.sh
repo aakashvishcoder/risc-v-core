@@ -58,6 +58,7 @@ for ma in "${MARCHES[@]}"; do
   make -s -C "$ROOT/sw" PROG=perftest MARCH=$ma BUILD=build/$ma >/dev/null
   make -s -C "$ROOT/sw" PROG=mext MARCH=$ma BUILD=build/$ma >/dev/null 2>&1 || true
   make -s -C "$ROOT/sw" PROG=cachetest MARCH=$ma BUILD=build/$ma >/dev/null
+  make -s -C "$ROOT/sw" PROG=coldload MARCH=$ma BUILD=build/$ma >/dev/null
   make -s -C "$ROOT/sw" PROG=coremark ITERATIONS=1 MARCH=$ma BUILD=build/$ma/cm1 >/dev/null
   cp "$ROOT/sw/build/$ma/cm1/coremark.hex" "$ROOT/out/coremark_1iter_$ma.hex"
   [[ $BENCH == 1 ]] && make -s -C "$ROOT/sw" PROG=coremark ITERATIONS=10 MARCH=$ma BUILD=build/$ma/cm10 >/dev/null
@@ -76,6 +77,7 @@ for c in "${CONFIGS[@]}"; do
   grep -q "perftest: 0 failures" "$ROOT/out/perftest.rtl.uart" 2>/dev/null || pt=FAIL
   SIM=$sim "$ROOT/tools/cosim.sh" "$B/cachetest.hex" >/dev/null 2>&1 || pt=FAIL
   grep -q "cachetest: 0 failures" "$ROOT/out/cachetest.rtl.uart" 2>/dev/null || pt=FAIL
+  SIM=$sim "$ROOT/tools/cosim.sh" "$B/coldload.hex" >/dev/null 2>&1 || pt=FAIL
   if [[ $m -ge 1 ]]; then
     SIM=$sim "$ROOT/tools/cosim.sh" "$B/mext.hex" >/dev/null 2>&1 || pt=FAIL
     grep -q " 0 failures" "$ROOT/out/mext.rtl.uart" 2>/dev/null || pt=FAIL
