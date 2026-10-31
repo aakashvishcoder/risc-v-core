@@ -87,18 +87,33 @@ Testbench options: `+trace=<file>` writes one line per retired instruction,
 
 ## Verification
 
-`make test` runs everything below in about a minute.
+`make test` runs everything below in about a minute and a half: every
+directed program on single-cycle RAM and on the cached memory system, then
+random programs on both.
 
 ```
 == reference model known-answer tests
 16/16 reference-model tests passed
-== directed programs (RTL vs reference model)
+== directed programs (RTL vs reference model), single-cycle RAM
 hello            MATCH: 788 instructions | uart ok | exit  code=0  cycles=956 ...
-perftest         MATCH: 21589 instructions | uart ok | exit  code=0  cycles=28800 ...
+perftest         MATCH: 38427 instructions | uart ok | exit  code=0  cycles=50422 ...
 mext             MATCH: 1037 instructions | uart ok | exit  code=0  cycles=3038 ...
-coremark_1iter   MATCH: 408859 instructions | uart ok | exit  code=0  cycles=469314 ...
-== random programs
+cachetest        MATCH: 49658 instructions | uart ok | exit  code=0  cycles=49772 ...
+coldload         MATCH: 744 instructions | uart ok | exit  code=0  cycles=906 ...
+memstream        MATCH: 162535 instructions | uart ok | exit  code=0  cycles=168076 ...
+coremark_1iter   MATCH: 411155 instructions | uart ok | exit  code=0  cycles=471753 ...
+== directed programs, caches + slow main memory
+hello            MATCH: 788 instructions | uart ok | exit  code=0  cycles=2225 ...
+perftest         MATCH: 38517 instructions | uart ok | exit  code=0  cycles=89644 ...
+mext             MATCH: 1037 instructions | uart ok | exit  code=0  cycles=5649 ...
+cachetest        MATCH: 93513 instructions | uart ok | exit  code=0  cycles=316115 ...
+coldload         MATCH: 744 instructions | uart ok | exit  code=0  cycles=2605 ...
+memstream        MATCH: 162805 instructions | uart ok | exit  code=0  cycles=561728 ...
+coremark_1iter   MATCH: 413727 instructions | uart ok | exit  code=0  cycles=547073 ...
+== random programs, single-cycle RAM
 random tests: 100 passed, 0 failed
+== random programs, caches + slow main memory
+random tests: 50 passed, 0 failed
 ```
 
 **Reference model.** `tools/iss.py` is an instruction-set simulator with no
@@ -152,46 +167,68 @@ overflow and evictions happen constantly.
 **Mutation testing.** Passing tests only matter if they would fail on a broken
 design. `tools/mutate.py` (`make mutate`) injects realistic bugs, one at a
 time, into a copy of the RTL and checks that the tests catch each. Random
-co-simulation (RV32IM) catches wrong results, `sw/mext` checks multiply/divide
-results directly, and the counter test (`perftest`) catches bugs that keep
-results correct but cost cycles:
+co-simulation (RV32IM) catches wrong results; `sw/mext` checks
+multiply/divide results directly; `sw/cachetest` (with `sw/coldload`) checks
+exact miss counts and data integrity; and the counter test (`perftest`)
+catches bugs that keep results correct but cost cycles. Memory-system mutants
+are built with caches in front of slow memory.
 
-| Injected bug | Random seeds failing (of 20) | perftest | mext |
-|---|---|---|---|
-| No MEM→EX forwarding | 20 | fail | fail |
-| No WB→EX forwarding | 20 | fail | fail |
-| Forwarding priority reversed (WB before MEM) | 20 | fail | fail |
-| Forwarding a result destined for x0 | 20 | fail | pass |
-| No load-use stall | 20 | fail | fail |
-| Load-use check ignores rs2 | 20 | fail | fail |
-| No flush after a taken branch | 20 | fail | fail |
-| JALR doesn't clear bit 0 | 19 | pass | pass |
-| BLTU compares signed | 14 | pass | pass |
-| LB zero-extends | 20 | pass | pass |
-| SB writes the wrong byte lane | 20 | pass | pass |
-| SRA behaves like SRL | 17 | pass | pass |
-| Register file not write-through | 20 | fail | fail |
-| Wrongly-taken branch resumes at its target, not pc+4 | 20 | fail | fail |
-| Prediction not passed to EX | 20 | fail | fail |
-| EX trusts a predicted JALR target without checking | 20 | fail | fail |
-| Decode redirect ignores a stall | 20 | fail | pass |
-| Decode redirect outranks an EX redirect | 20 | fail | pass |
-| Decode drops JAL | 20 | fail | fail |
-| No multiply-use stall | 6 | fail | fail |
-| MULHSU treats rs2 as signed | 8 | pass | fail |
-| MULH* return the low word | 20 | fail | fail |
-| Divide doesn't hold EX | 20 | fail | fail |
-| No MEM bubbles while dividing | 20 | pass | pass |
-| Divide by zero returns 0 | 17 | pass | fail |
-| REM takes the divisor's sign | 5 | pass | fail |
-| Branch history table never trained | **0** | fail | pass |
-| gshare history never updated | **0** | fail | pass |
-| Return-address stack never pops | **0** | fail | pass |
-| Return-address stack pushes pc instead of pc+4 | **0** | fail | pass |
-| Divide by zero runs all 32 iterations | **0** | fail | pass |
+| Injected bug | Random seeds failing (of 20) | perftest | mext | cachetest |
+|---|---|---|---|---|
+| No MEM→EX forwarding | 20 | fail | fail | fail |
+| No WB→EX forwarding | 20 | fail | fail | fail |
+| Forwarding priority reversed (WB before MEM) | 20 | fail | fail | fail |
+| Forwarding a result destined for x0 | 20 | fail | pass | pass |
+| No load-use stall | 20 | fail | fail | pass |
+| Load-use check ignores rs2 | 20 | fail | fail | pass |
+| No flush after a taken branch | 20 | fail | fail | pass |
+| JALR doesn't clear bit 0 | 19 | pass | pass | pass |
+| BLTU compares signed | 17 | pass | pass | pass |
+| LB zero-extends | 20 | pass | pass | pass |
+| SB writes the wrong byte lane | 20 | pass | pass | pass |
+| SRA behaves like SRL | 18 | pass | pass | pass |
+| Register file not write-through | 20 | fail | fail | fail |
+| Wrongly-taken branch resumes at its target, not pc+4 | 20 | fail | fail | pass |
+| Prediction not passed to EX | 20 | fail | fail | pass |
+| EX trusts a predicted JALR target without checking | 20 | fail | fail | pass |
+| Decode redirect ignores a stall | 20 | fail | pass | pass |
+| Decode redirect outranks an EX redirect | 20 | fail | pass | pass |
+| Decode drops JAL | 20 | fail | fail | fail |
+| No multiply-use stall | 8 | fail | fail | pass |
+| MULHSU treats rs2 as signed | 5 | pass | fail | pass |
+| MULH* return the low word | 20 | fail | fail | pass |
+| Divide doesn't hold EX | 20 | fail | fail | pass |
+| No MEM bubbles while dividing | 20 | pass | pass | pass |
+| Divide by zero returns 0 | 18 | pass | fail | pass |
+| REM takes the divisor's sign | 7 | pass | fail | pass |
+| D-cache dirty bit never set | 20 | pass | pass | fail |
+| D-cache writes back to the missing line's address | 20 | pass | pass | fail |
+| D-cache refills over a dirty victim without writing it back | 20 | pass | pass | fail |
+| D-cache store hit writes way 0 | 20 | fail | fail | fail |
+| D-cache load returns the word from the wrong way | 20 | fail | fail | fail |
+| I-cache hit ignores the tag | 20 | fail | pass | fail |
+| I-cache miss still decoded | 20 | fail | fail | fail |
+| EX operands not refreshed during a stall | 20 | fail | fail | fail |
+| D-cache hit ignores the valid bit | **0** | pass | pass | fail ¹ |
+| Branch history table never trained | **0** | fail | pass | pass |
+| gshare history never updated | **0** | fail | pass | pass |
+| Return-address stack never pops | **0** | fail | pass | pass |
+| Return-address stack pushes pc instead of pc+4 | **0** | fail | pass | pass |
+| Divide by zero runs all 32 iterations | **0** | fail | pass | pass |
+| D-cache LRU never updated | **0** | pass | pass | fail |
+| Load-use also counted during a cache stall | **0** | fail ² | pass | pass |
 
-31/31 killed. The five marked **0** are performance bugs: the core still
-computes the right answers, so no amount of co-simulation can find them.
+42/42 killed. The rows marked **0** keep every result correct, so no amount
+of co-simulation can find them; only the counter and cache tests can.
+
+Two of these survived the first run, and the fixes are worth noting:
+1. ¹ A cache that ignores the valid bit only false-hits on never-filled
+   sets, and startup code clearing `.bss` fills every set before any test
+   runs. `sw/coldload` has almost no data, and its first loads read code as
+   data through a cold cache.
+2. ² `perftest`'s kernels ran warm and never missed in the data cache. A new
+   kernel strides through 6.4 KB so every load misses, and checks that the
+   load-use stall behind each one is still counted exactly once.
 
 ## Performance
 
