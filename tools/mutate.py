@@ -12,6 +12,8 @@ and checked two ways:
     answers, so co-simulation can't see them, but event counts are off
   - sw/cachetest checks exact miss/writeback counts and data integrity, and
     sw/coldload checks the first loads into a cold data cache
+  - random programs that take exceptions and interrupts, plus sw/traptest,
+    sw/irqtest and the scheduler demo (sw/sched), check the trap machinery
 A mutant is "killed" if any check fails. A surviving mutant means a hole in
 the tests (or an equivalent mutant that doesn't change behavior). Mutants of
 the memory system are built with caches in front of slow main memory.
@@ -177,6 +179,59 @@ MUTANTS = [
     ("D-cache LRU never updated", "rv_dcache.sv",
      "if (WAYS > 1 && req && hit) lru[idx] <= !hit_way[0];",
      "", CACHED),
+    # --- traps and interrupts ---
+    ("faulting store still writes memory", "rv_core.sv",
+     "if (ex_live && ex.c.is_store) begin",
+     "if (ex.valid && ex.c.is_store) begin"),
+    ("faulting instruction still writes its register", "rv_core.sv",
+     "mem.reg_we  <= ex_live && !ex_stall && ex.c.reg_we;",
+     "mem.reg_we  <= ex.valid && !ex_stall && ex.c.reg_we;"),
+    ("trapped CSR instruction still writes the CSR", "rv_core.sv",
+     "wire csr_we = ex_live && csr_writes;",
+     "wire csr_we = ex.valid && csr_writes;"),
+    ("mepc saves the next pc", "rv_core.sv",
+     "mepc     <= {ex.pc[31:2], 2'b00};",
+     "mepc     <= ex.pc + 32'd4;"),
+    ("instruction in ID survives a trap", "rv_core.sv",
+     "end else if (redirect_ex || stall_d || !valid_i) begin",
+     "end else if ((redirect_ex && !trap_take) || stall_d || !valid_i) begin"),
+    ("trap entry leaves mstatus.MIE set", "rv_core.sv",
+     """        mst_mpie <= mst_mie;
+        mst_mie  <= 1'b0;""",
+     """        mst_mpie <= mst_mie;"""),
+    ("mret leaves interrupts disabled", "rv_core.sv",
+     "mst_mie  <= mst_mpie;",
+     "mst_mie  <= 1'b0;"),
+    ("interrupts ignore mstatus.MIE", "rv_core.sv",
+     "wire irq_take = ex.valid && mst_mie && (irq_pend != 32'b0) &&",
+     "wire irq_take = ex.valid && (irq_pend != 32'b0) &&"),
+    ("timer outranks external interrupts", "rv_core.sv",
+     "wire [4:0]  irq_code = irq_pend[11] ? 5'd11 : irq_pend[3] ? 5'd3 : 5'd7;",
+     "wire [4:0]  irq_code = irq_pend[7] ? 5'd7 : irq_pend[11] ? 5'd11 : 5'd3;"),
+    ("vectored mode ignored", "rv_core.sv",
+     "((irq_take && mtvec[0]) ? {25'b0, irq_code, 2'b00} : 32'b0);",
+     "32'b0;"),
+    ("misaligned jump targets not detected", "rv_core.sv",
+     "                         jump_target[1];",
+     "                         1'b0;"),
+    ("no access faults for loads/stores", "rv_core.sv",
+     "wire ls_mapped     = (ls_addr < 32'(RAM_BYTES)) ||",
+     "wire ls_mapped     = 1'b1 || (ls_addr < 32'(RAM_BYTES)) ||"),
+    ("no fetch access faults", "rv_core.sv",
+     "wire        fetch_fault = (pc_d >= 32'(RAM_BYTES));",
+     "wire        fetch_fault = 1'b0;"),
+    ("illegal-instruction mtval holds the pc", "rv_core.sv",
+     "begin exc_cause = 32'd2;  exc_tval = ex.instr; end",
+     "begin exc_cause = 32'd2;  exc_tval = ex.pc; end"),
+    ("writes to read-only CSRs allowed", "rv_core.sv",
+     "(!csr_known || (csr_writes && csr_addr[11:10] == 2'b11))",
+     "(!csr_known)"),
+    ("mcountinhibit doesn't stop mcycle", "rv_core.sv",
+     "else if (!mcountinhibit[0])      cycle_ctr <= cycle_ctr + 64'd1;",
+     "else                             cycle_ctr <= cycle_ctr + 64'd1;"),
+    ("timer interrupt only on mtime == mtimecmp", "rv_clint.sv",
+     "assign irq_timer = (mtime >= mtimecmp);",
+     "assign irq_timer = (mtime == mtimecmp);"),
     ("load-use also counted during a cache stall", "rv_core.sv",
      "assign perf_ev[0] = valid_i && load_use && !redirect_ex && !ex_stall;",
      "assign perf_ev[0] = valid_i && load_use && !redirect_ex;", CACHED),
@@ -200,7 +255,7 @@ def main():
     args = ap.parse_args()
 
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    for prog in ("perftest", "mext", "cachetest", "coldload"):
+    for prog in ("perftest", "mext", "cachetest", "coldload", "traptest", "irqtest", "sched"):
         if run(f"make -s -C {ROOT}/sw PROG={prog}").returncode != 0:
             sys.exit(f"could not build {prog}")
     perftest = f"{ROOT}/sw/build/perftest.hex"
@@ -242,12 +297,22 @@ def main():
             k = run(f"{obj}/Vrv_soc +firmware={coldload} +max_cycles=1000000")
             cache_fail = (c.returncode != 0 or "cachetest: 0 failures" not in c.stdout or
                           k.returncode != 0 or "coldload: 0 failures" not in k.stdout)
-            dead = failed > 0 or perf_fail or mext_fail or cache_fail
+            # Traps: random programs that trap and get interrupted, and the
+            # directed trap/interrupt tests
+            r = run(f"{ROOT}/tools/run_random.sh {args.seeds // 2} {args.first_seed + 5000} --m",
+                    env=dict(env, SIM=f"{obj}/Vrv_soc", KEEP_FAILS="0", TRAPS="1"))
+            summary = r.stdout.strip().splitlines()[-1]
+            tfailed = int(summary.split(",")[1].split()[0])
+            trap_fail = tfailed > 0
+            for prog, limit in (("traptest", 5000000), ("irqtest", 5000000), ("sched", 10000000)):
+                t = run(f"{obj}/Vrv_soc +firmware={ROOT}/sw/build/{prog}.hex +max_cycles={limit}")
+                trap_fail |= t.returncode != 0 or f"{prog}: 0 failures" not in t.stdout
+            dead = failed > 0 or perf_fail or mext_fail or cache_fail or trap_fail
             killed += dead
             f = lambda x: "FAIL" if x else "pass"
             print(f"  {'KILLED' if dead else 'SURVIVED':8} {name:46} "
                   f"random {failed:2}/{args.seeds}  perftest {f(perf_fail)}  mext {f(mext_fail)}"
-                  f"  cachetest {f(cache_fail)}")
+                  f"  cachetest {f(cache_fail)}  traps {tfailed:2}/{args.seeds // 2} {f(trap_fail)}")
         finally:
             shutil.rmtree(work, ignore_errors=True)
 

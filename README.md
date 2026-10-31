@@ -1,9 +1,11 @@
 # risc-v-core
 
-A 5-stage pipelined RISC-V (RV32IM) processor written in SystemVerilog, with
-gshare branch prediction, a return-address stack, an indirect jump target
-buffer, a hardware multiplier and divider, and optional instruction and
-write-back data caches in front of a slow main memory, built to run on my
+A 5-stage pipelined RISC-V (RV32IM + Zicsr) processor written in
+SystemVerilog, with gshare branch prediction, a return-address stack, an
+indirect jump target buffer, a hardware multiplier and divider, optional
+instruction and write-back data caches in front of a slow main memory, and
+precise machine-mode exceptions and interrupts (enough to run a preemptive
+multitasking kernel), built to run on my
 [Artix-7 FPGA carrier board](https://github.com/aakashvishcoder/fpgacarrierboard).
 
 ## Status
@@ -19,13 +21,24 @@ printing that took 232 cycles, 201 instructions
 
 | | Baseline pipeline | + branch prediction | + multiply/divide | + caches, slow memory |
 |---|---|---|---|---|
-| CoreMark/MHz | 0.970 | 1.082 (+11.6%) | **2.374** (2.45× baseline) | 2.205 |
-| CPI | 1.164 | 1.043 | 1.138 | 1.226 |
+| CoreMark/MHz | 0.970 | 1.082 (+11.6%) | **2.372** (2.45× baseline) | 2.203 |
+| CPI | 1.164 | 1.043 | 1.139 | 1.227 |
 | Instructions (10 iterations) | 8.85M | 8.85M | 3.70M | 3.70M |
 
 The first three columns use single-cycle on-chip RAM. The last puts a
 20-cycle main memory behind 2 KB instruction and data caches; they recover
 93% of the single-cycle performance.
+
+`make demo` runs three tasks time-sliced by the timer interrupt; each is
+stopped between arbitrary instructions hundreds of times and must still get
+the same answer as when it ran alone:
+
+```
+sched: all tasks done after 429 context switches
+  primes   result        430  reference        430  ran in 316 slices  ok
+  collatz  result     327143  reference     327143  ran in  73 slices  ok
+  sort     result  959527861  reference  959527861  ran in  41 slices  ok
+```
 
 ## Roadmap
 
@@ -37,7 +50,9 @@ The first three columns use single-cycle on-chip RAM. The last puts a
 - [x] Branch prediction: static, bimodal, gshare, return-address stack, indirect target buffer
 - [x] M extension: pipelined multiplier, iterative divider
 - [x] Instruction cache and 2-way write-back data cache in front of a slow main memory
-- [ ] Machine-mode traps, CSRs, timer interrupts
+- [x] Precise machine-mode exceptions, full CSR file, CLINT timer/software/external interrupts
+- [ ] FPGA synthesis and timing (Fmax, resource use)
+- [ ] Official RISC-V architecture compliance tests
 - [ ] FPGA bring-up on the carrier board
 
 ## Layout
@@ -58,6 +73,7 @@ make -C sw PROG=hello                      # build a program
 make -C sim                                # build the simulator
 make -C sim run HEX=../sw/build/hello.hex  # run it
 make test                                  # full test suite
+make demo                                  # preemptive scheduler demo
 make bench                                 # CoreMark with a CPI breakdown
 make study                                 # branch predictor what-if study
 make cache-study                           # cache what-if study
@@ -82,8 +98,9 @@ configuration from the `mconfig` (0xFC0) and `mcache` (0xFC1) CSRs. Programs
 build for `rv32im` by default; pass `MARCH=rv32i_zicsr` (or
 `rv32i_zmmul_zicsr`) to `make -C sw` for a core without M.
 
-Testbench options: `+trace=<file>` writes one line per retired instruction,
-`+vcd=<file>` dumps waveforms, `+max_cycles=<n>` sets a timeout.
+Testbench options: `+trace=<file>` writes one line per retired instruction
+(and one per trap taken), `+vcd=<file>` dumps waveforms, `+max_cycles=<n>`
+sets a timeout.
 
 ## Verification
 
@@ -153,6 +170,31 @@ writes and reads back two cache-sizes of data with word and byte stores.
 Random programs spread their data over 2 KB, more than the default data
 cache, so lines are evicted and written back constantly. `make test` runs
 everything on both single-cycle RAM and the cached memory system.
+
+**Traps and interrupts.** `sw/traptest` raises every exception the core
+implements and checks `mcause`, `mepc` and `mtval`. It also checks that the
+faulting instruction left its destination register and memory untouched:
+after a load-use stall, behind a 33-cycle divide, a misaligned `sh` aimed at
+the UART, and jumps the predictor had already followed to a misaligned
+target. It covers the `mstatus` stack, CSR write masks and the counters.
+`sw/irqtest` covers:
+- timer, software and external interrupts
+- masking by `mstatus.MIE` and by `mie`
+- priority
+- an interrupt raised inside a handler, which must wait for `mret`
+- direct and vectored modes, and `wfi`
+- a busy loop of loads, stores, multiplies, divides, branches and calls,
+  interrupted about every 100 cycles (1,250+ times), which must compute
+  exactly what it does undisturbed
+
+Random programs run a second time with `--traps`. A handler that preserves
+every register is installed, the timer fires at random 40-295 cycle
+intervals, and the random stream mixes in ecall/ebreak, illegal
+instructions and CSRs, misaligned and out-of-map loads, stores and fetches,
+misaligned jump and branch targets, self-inflicted software and external
+interrupts, toggling of `mstatus.MIE`/`mie`, and reads of
+`mcause`/`mepc`/`mtval`/`mip` into the hot registers. That comes to about
+60 traps of every kind per program, on top of all the pipeline hazards.
 
 **Every configuration.** `make test-configs` builds sixteen configurations,
 from the baseline pipeline up to full prediction with RV32IM, plus five
@@ -565,3 +607,55 @@ All prediction happens in decode, and all of it is checked in execute.
 - **With caches**, an instruction-cache miss empties ID until the line
   arrives, and a data-cache miss holds EX (like a divide); hits take exactly
   the same time as the single-cycle RAM.
+
+## Traps and interrupts
+
+Machine mode only, following the RISC-V privileged spec.
+
+- **Every trap is taken in EX.** That's the one stage where everything needed
+  is known: decode flags (illegal instruction, `ecall`, `ebreak`), the
+  load/store address (misaligned, or outside RAM, the CLINT and the I/O page),
+  and the jump or branch target (misaligned). Nothing older can still fault.
+  The only younger instruction is in ID and hasn't changed any state, so
+  traps are precise for free. Taking one squashes the instruction in EX (no
+  register, memory or CSR write), saves `mepc`/`mcause`/`mtval`, pushes
+  `mstatus.MIE` into `MPIE` and redirects fetch to `mtvec`, the same as a
+  mispredicted branch.
+- **A fetch from outside RAM never touches memory.** It becomes a NOP that
+  carries an access fault, raised when it reaches EX.
+- **Interrupts replace the instruction in EX.** `mepc` points at that
+  instruction and it runs after `mret`. An interrupt is taken when
+  `mstatus.MIE` is set and some interrupt is both pending and enabled in
+  `mie`, with priority external > software > timer. Vectored `mtvec` sends
+  interrupt N to `BASE + 4N`.
+- **Loads, stores and divides are never interrupted**, since they may
+  already be waiting on memory or iterating. The next instruction is
+  interruptible, so this costs at most one divide or one cache miss of
+  latency. Measured in `sw/irqtest`, from `mtime` reaching `mtimecmp` to
+  the handler reading `mtime`, after saving 16 registers and calling into C:
+  45 cycles.
+- **Traps show up in the commit trace.** A marker travels down MEM and WB in
+  the squashed slot, so traps appear in program order. The reference model
+  checks every exception itself. For interrupts it takes them where the RTL
+  did, but only after checking they were enabled there.
+- **The performance counters stay exact across traps.** `hpmcounter17`
+  counts traps (each costs its squashed slot plus one flush cycle). Events
+  that insert a bubble are counted in the cycle the bubble costs. With both,
+  the cycle-accounting identity holds over any window of cycles, including
+  the window between two `mcountinhibit` writes.
+
+| CSR | Notes |
+|---|---|
+| `mstatus` | MIE, MPIE; MPP reads 11 |
+| `misa` | RV32I or RV32IM, read-only |
+| `mie`, `mip` | MSI (3), MTI (7), MEI (11); `mip` is read-only |
+| `mtvec` | direct or vectored |
+| `mscratch`, `mepc`, `mcause`, `mtval` | |
+| `mcycle`, `minstret`, `mhpmcounter3-17` | writable; `cycle`/`instret`/`hpmcounterN` read-only shadows |
+| `mcountinhibit` | freezes any counter |
+| `mconfig` (0xFC0), `mcache` (0xFC1) | build configuration, read-only |
+
+Any other CSR, or a write to a read-only one, is an illegal instruction. The
+CLINT (`rv_clint.sv`) uses the standard layout at `0x0200_0000`: `msip` at
++0, `mtimecmp` at +0x4000 and `mtime` at +0xBFF8. A test register at
+`0x1000_0010` drives the external interrupt line.
