@@ -1,11 +1,11 @@
 # Kernels with exactly known performance-event counts.
 #
-# Each kernel is   void kN(uint32_t delta[9])
-# It snapshots cycle + hpmcounter3..10, runs a loop, snapshots again, and
-# writes the nine differences to delta[]:
+# Each kernel is   void kN(uint32_t delta[10])
+# It snapshots cycle + hpmcounter3..11, runs a loop, snapshots again, and
+# writes the ten differences to delta[]:
 #   [0] cycles  [1] load-use stalls  [2] flush cycles  [3] branches
 #   [4] taken branches  [5] jumps  [6] branch mispredicts  [7] jump redirects
-#   [8] multiply-use stalls
+#   [8] multiply-use stalls  [9] divider stall cycles
 #
 # Snapshots read the counters in the same order at the start and the end, so
 # each counter is sampled the same distance from its own reads and the
@@ -23,6 +23,7 @@
     csrr s8, hpmcounter8
     csrr s9, hpmcounter9
     csrr s10, hpmcounter10
+    csrr s11, hpmcounter11
 .endm
 
 .macro DIFF1 csr, saved, off
@@ -41,6 +42,7 @@
     DIFF1 hpmcounter8, s8, 24
     DIFF1 hpmcounter9, s9, 28
     DIFF1 hpmcounter10, s10, 32
+    DIFF1 hpmcounter11, s11, 36
 .endm
 
 .macro PROLOGUE
@@ -54,7 +56,8 @@
     sw   s8, 24(sp)
     sw   s9, 28(sp)
     sw   s10, 32(sp)
-    sw   ra, 36(sp)
+    sw   s11, 36(sp)
+    sw   ra, 40(sp)
 .endm
 
 .macro EPILOGUE
@@ -67,7 +70,8 @@
     lw   s8, 24(sp)
     lw   s9, 28(sp)
     lw   s10, 32(sp)
-    lw   ra, 36(sp)
+    lw   s11, 36(sp)
+    lw   ra, 40(sp)
     addi sp, sp, 48
     ret
 .endm
@@ -190,6 +194,22 @@ k8:
     addi t3, t3, -1                   # independent filler
     bnez t5, 2f                       # product now comes from WB: no stall
 2:  bnez t3, 1b
+    DIFF
+    EPILOGUE
+
+# k9: a divide whose result is used right away, and a divide by zero
+# (500 instructions). Only called on a core with a divider.
+    .globl k9
+k9:
+    PROLOGUE
+    li   t3, N
+    li   t4, 1000
+    SNAP
+1:  .insn r 0x33, 5, 1, t2, t4, t3    # divu t2, t4, t3   (t3 = N..1, never 0)
+    add  t5, t2, t2                   # quotient forwarded from MEM: no extra stall
+    .insn r 0x33, 7, 1, t6, t4, x0    # remu t6, t4, x0   (divide by zero)
+    addi t3, t3, -1
+    bnez t3, 1b
     DIFF
     EPILOGUE
 

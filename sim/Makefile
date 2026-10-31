@@ -4,7 +4,7 @@
 #   make run HEX=... ARGS="+trace=t.txt +vcd=wave.vcd"
 #   make OBJ=obj_base EARLY_JAL=0           -> another configuration
 RTL_DIR = ../rtl
-RTL = $(RTL_DIR)/rv_alu.sv $(RTL_DIR)/rv_regfile.sv $(RTL_DIR)/rv_core.sv \
+RTL = $(RTL_DIR)/rv_alu.sv $(RTL_DIR)/rv_divider.sv $(RTL_DIR)/rv_regfile.sv $(RTL_DIR)/rv_core.sv \
       $(RTL_DIR)/rv_ram.sv $(RTL_DIR)/uart_tx.sv $(RTL_DIR)/rv_soc.sv
 
 OBJ ?= obj_dir
@@ -16,7 +16,7 @@ BHT_BITS  ?= 8
 GHR_BITS  ?= 8
 RAS_DEPTH ?= 8
 IBTB_BITS ?= 4
-M_EXT     ?= 1
+M_EXT     ?= 2
 PARAMS = -GEARLY_JAL=$(EARLY_JAL) -GBPRED=$(BPRED) -GBHT_BITS=$(BHT_BITS) -GGHR_BITS=$(GHR_BITS) \
          -GRAS_DEPTH=$(RAS_DEPTH) -GIBTB_BITS=$(IBTB_BITS) -GM_EXT=$(M_EXT)
 VFLAGS = --cc --exe --build -j 0 -O3 --trace -Wall -Wno-fatal \

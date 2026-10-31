@@ -32,7 +32,7 @@ module rv_core #(
   parameter int          GHR_BITS  = 8,       // gshare global history length
   parameter int          RAS_DEPTH = 8,       // return-address stack entries (0 = none)
   parameter int          IBTB_BITS = 4,       // log2(indirect jump target buffer entries), 0 = none
-  parameter int          M_EXT     = 1        // 0 none, 1 Zmmul (multiply only)
+  parameter int          M_EXT     = 2        // 0 none, 1 Zmmul (multiply only), 2 full M
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -75,6 +75,7 @@ module rv_core #(
     logic       is_load;
     logic       is_store;
     logic       is_mul;
+    logic       is_div;
     logic [1:0] wb_sel;
     logic       trap;
   } ctrl_t;
@@ -197,9 +198,12 @@ module rv_core #(
         c_d.reg_we = 1; c_d.uses_rs1 = 1; c_d.uses_rs2 = 1;
         c_d.alu_op = {instr_d[30], f3_d};
         if (f7_d == 7'b0000001) begin
-          // M extension: MUL/MULH/MULHSU/MULHU (funct3 0-3)
+          // M extension: MUL/MULH/MULHSU/MULHU (funct3 0-3),
+          //              DIV/DIVU/REM/REMU     (funct3 4-7)
           c_d.is_mul = (M_EXT >= 1) && !f3_d[2];
-          c_d.trap   = !c_d.is_mul;
+          c_d.is_div = (M_EXT >= 2) &&  f3_d[2];
+          c_d.wb_sel = c_d.is_div ? WB_DIV : WB_ALU;
+          c_d.trap   = !(c_d.is_mul || c_d.is_div);
         end else begin
           c_d.trap = !((f7_d == 7'b0) ||
                        (f7_d == 7'b0100000 && (f3_d == 3'b000 || f3_d == 3'b101)));
@@ -327,10 +331,11 @@ module rv_core #(
   //   9  jump redirects from EX    (jumps not followed in decode, or followed
   //                                 to the wrong target)
   //  10  multiply-use stall cycles ID held because EX has a multiply it depends on
+  //  11  divider stall cycles      EX busy with a divide
   // Every flush is one or the other, so event 4 == event 8 + event 9, and
-  //   cycles = instret + load-use + multiply-use stalls + flush cycles + fill.
+  //   cycles = instret + load-use + multiply-use + divider stalls + flushes + fill.
   // -------------------------------------------------------------------------
-  localparam int NHPM = 8;               // hpmcounter3 .. hpmcounter10
+  localparam int NHPM = 9;               // hpmcounter3 .. hpmcounter11
   logic [NHPM-1:0] perf_ev;
   logic [63:0]     hpm [NHPM];
 
@@ -342,6 +347,7 @@ module rv_core #(
   assign perf_ev[5] = br_mispredict;
   assign perf_ev[6] = jmp_redirect;
   assign perf_ev[7] = valid_d && mul_use && !redirect_ex && !halt_fetch;
+  assign perf_ev[8] = ex_stall;
 
   // Read-only configuration register in the custom machine CSR space, so
   // software (tests, benchmarks) can tell which features this build has.
@@ -351,7 +357,7 @@ module rv_core #(
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
   //   [19:16] log2(branch history table entries)
   //   [23:20] gshare global history length
-  //   [25:24] M extension: 0 none, 1 Zmmul (multiply only)
+  //   [25:24] M extension: 0 none, 1 Zmmul (multiply only), 2 full M
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
   wire [31:0] mconfig = {6'b0, 2'(M_EXT), 4'(GHR_BITS), 4'(BHT_BITS), 4'(IBTB_BITS),
                          8'(RAS_DEPTH), 3'(BPRED), EARLY_JAL};
@@ -364,7 +370,8 @@ module rv_core #(
       12'hC80, 12'hC81, 12'hB80: csr_val = cycle_ctr[63:32];
       12'hC02, 12'hB02:          csr_val = instret_ctr[31:0];
       12'hC82, 12'hB82:          csr_val = instret_ctr[63:32];
-      12'h301:                   csr_val = 32'h4000_0100;  // misa: RV32I
+      12'h301:                   csr_val = (M_EXT >= 2) ? 32'h4000_1100    // misa: RV32IM
+                                                    : 32'h4000_0100;   //       RV32I
       CSR_MCONFIG:               csr_val = mconfig;
       default:                   csr_val = 32'b0;          // mhartid etc.
     endcase
@@ -382,6 +389,7 @@ module rv_core #(
     unique case (ex.c.wb_sel)
       WB_PC4:  ex_result = ex.pc + 32'd4;
       WB_CSR:  ex_result = csr_val;
+      WB_DIV:  ex_result = div_result;
       default: ex_result = alu_y;
     endcase
   end
@@ -394,6 +402,37 @@ module rv_core #(
   wire b_signed = (f3_e[1:0] == 2'b01);                           // MULH
   wire [32:0] mul_a_e = {a_signed & a_fwd[31], a_fwd};
   wire [32:0] mul_b_e = {b_signed & b_fwd[31], b_fwd};
+
+  // -------------------------------------------------------------------------
+  // Divider: iterative, so a divide holds EX until it's done (33 cycles: one
+  // to start, 32 iterations; divide by zero takes one). Everything behind it
+  // waits in ID; MEM gets bubbles. The result leaves EX like an ALU result,
+  // so a dependent instruction gets it by forwarding with no extra stall.
+  // -------------------------------------------------------------------------
+  logic        div_issued, div_busy, div_done;
+  logic [31:0] div_result;
+  wire div_pending = (M_EXT >= 2) && ex.valid && ex.c.is_div;
+  wire div_start   = div_pending && !div_issued && !halted;
+  wire ex_stall    = div_pending && !(div_issued && div_done);
+
+  generate
+    if (M_EXT >= 2) begin : g_div
+      rv_divider u_div (
+        .clk, .rst,
+        .start  (div_start),
+        .op     (f3_e[1:0]),
+        .a      (a_fwd),
+        .b      (b_fwd),
+        .busy   (div_busy),
+        .done   (div_done),
+        .result (div_result)
+      );
+    end else begin : g_nodiv
+      assign div_busy   = 1'b0;
+      assign div_done   = 1'b0;
+      assign div_result = 32'b0;
+    end
+  endgenerate
 
   // Data memory request (address = ALU result for loads/stores)
   wire [1:0] byte_off = alu_y[1:0];
@@ -512,7 +551,7 @@ module rv_core #(
   wire [31:0] target_id   = jalr_pred_d ? jalr_target_d
                                         : pc_d + (c_d.is_jal ? imm_j : imm_b);
 
-  wire stall_d = load_use || mul_use || halt_fetch;
+  wire stall_d = load_use || mul_use || ex_stall || halt_fetch;
   logic [31:0] fetch_pc;
   always_comb begin
     if (redirect_ex)              fetch_pc = target_ex;  // EX outranks ID: ID may be wrong-path
@@ -556,6 +595,7 @@ module rv_core #(
       mem         <= '0;
       wb          <= '0;
       halt_fetch  <= 1'b0;
+      div_issued  <= 1'b0;
       halted      <= 1'b0;
       ras_top     <= '0;
       cycle_ctr   <= '0;
@@ -584,7 +624,9 @@ module rv_core #(
       end
 
       // ID -> EX
-      if (redirect_ex || stall_d || !valid_d) begin
+      if (ex_stall) begin
+        // EX is busy dividing: hold it (ID holds too, via stall_d)
+      end else if (redirect_ex || stall_d || !valid_d) begin
         ex <= '0;  // bubble
       end else begin
         ex.valid   <= 1'b1;
@@ -606,11 +648,14 @@ module rv_core #(
       end
 
       // EX -> MEM
-      mem.valid   <= ex.valid;
+      if (div_start)      div_issued <= 1'b1;
+      else if (!ex_stall) div_issued <= 1'b0;
+
+      mem.valid   <= ex.valid && !ex_stall;
       mem.pc      <= ex.pc;
       mem.instr   <= ex.instr;
       mem.rd      <= ex.rd;
-      mem.reg_we  <= ex.valid && ex.c.reg_we;
+      mem.reg_we  <= ex.valid && !ex_stall && ex.c.reg_we;
       mem.is_load <= ex.valid && ex.c.is_load;
       mem.is_mul  <= ex.valid && ex.c.is_mul;
       mem.mul_a   <= mul_a_e;
@@ -618,7 +663,7 @@ module rv_core #(
       mem.funct3  <= f3_e;
       mem.addr_lo <= byte_off;
       mem.result  <= ex_result;
-      mem.trap    <= ex.valid && ex.c.trap;
+      mem.trap    <= ex.valid && !ex_stall && ex.c.trap;
 
       // MEM -> WB
       wb.valid  <= mem.valid;

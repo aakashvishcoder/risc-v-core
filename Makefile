@@ -1,5 +1,5 @@
 # Top-level convenience targets.
-#   make test        reference-model tests + directed programs + 100 random seeds
+#   make test        reference-model tests + directed programs + 100 random seeds (RV32IM)
 #   make test-quick  same with 20 random seeds
 #   make test-configs  every predictor configuration: perftest, CoreMark, random (~4 min)
 #   make bench-configs same, plus CoreMark/MHz per configuration
@@ -31,7 +31,7 @@ test: sim progs
 	@mkdir -p out && cp sw/build/cm1/coremark.hex out/coremark_1iter.hex
 	@tools/cosim.sh out/coremark_1iter.hex
 	@echo "== random programs"
-	@tools/run_random.sh $(SEEDS) 1
+	@tools/run_random.sh $(SEEDS) 1 --m
 
 test-quick:
 	@$(MAKE) -s test SEEDS=20

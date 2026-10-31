@@ -1,9 +1,10 @@
 # Build RV32I programs with clang + ld.lld.
 #   make PROG=hello          -> build/hello.{elf,bin,hex,dis}
 #   make PROG=coremark ITERATIONS=10
-#   make PROG=hello MARCH=rv32i_zicsr      -> for a core without multiply
+#   make PROG=hello MARCH=rv32i_zicsr      -> for a core without multiply/divide
+#   make PROG=hello MARCH=rv32i_zmmul_zicsr -> multiply only
 PROG   ?= hello
-MARCH  ?= rv32i_zmmul_zicsr
+MARCH  ?= rv32im_zicsr
 OPT    ?= -O2
 BUILD  ?= build
 

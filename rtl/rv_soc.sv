@@ -18,7 +18,7 @@ module rv_soc #(
   parameter int    GHR_BITS     = 8,
   parameter int    RAS_DEPTH    = 8,
   parameter int    IBTB_BITS    = 4,
-  parameter int    M_EXT        = 1
+  parameter int    M_EXT        = 2
 ) (
   input  logic        clk,
   input  logic        rst,

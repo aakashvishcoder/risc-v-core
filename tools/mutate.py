@@ -112,7 +112,7 @@ MUTANTS = [
      "ras[ras_inc] <= pc_d;"),
 ]
 
-RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_regfile.sv", "rv_core.sv",
+RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_divider.sv", "rv_regfile.sv", "rv_core.sv",
              "rv_ram.sv", "uart_tx.sv", "rv_soc.sv"]
 
 

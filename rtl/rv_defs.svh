@@ -35,6 +35,7 @@ localparam logic [1:0] A_ZERO = 2'd2;
 localparam logic [1:0] WB_ALU = 2'd0;
 localparam logic [1:0] WB_PC4 = 2'd1;
 localparam logic [1:0] WB_CSR = 2'd2;
+localparam logic [1:0] WB_DIV = 2'd3;
 
 localparam logic [31:0] INSTR_NOP = 32'h0000_0013;
 
