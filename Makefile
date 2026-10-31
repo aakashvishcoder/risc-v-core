@@ -3,11 +3,12 @@
 #   make test-quick  same with 20 random seeds
 #   make mutate      mutation testing (slow, ~3 min)
 #   make bench       CoreMark (10 iterations) with the CPI stack
+#   make study       trace-driven branch predictor study on CoreMark
 SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: test test-quick mutate bench sim hello progs clean
+.PHONY: test test-quick mutate bench study sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -37,6 +38,13 @@ bench: sim
 	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=10
 	@sim/obj_dir/Vrv_soc +firmware=sw/build/coremark.hex 2>&1 | \
 	  sed -n '/^\[0\]crc/p; /^risc-v-core:/,$$p'
+
+study: sim
+	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=1 BUILD=build/cm1
+	@mkdir -p out
+	@sim/obj_dir/Vrv_soc +firmware=sw/build/cm1/coremark.hex +trace=out/coremark_1iter.rtl \
+	  >/dev/null 2>out/coremark_1iter.rtl.log
+	@python3 tools/bpred_study.py out/coremark_1iter.rtl
 
 mutate: sim
 	@python3 tools/mutate.py --seeds 20
