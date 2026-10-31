@@ -27,7 +27,8 @@
 module rv_core #(
   parameter logic [31:0] RESET_PC  = 32'h0000_0000,
   parameter bit          EARLY_JAL = 1'b1,    // resolve JAL in decode (0-cycle penalty)
-  parameter int          BPRED     = 1        // 0 predict not-taken, 1 static BTFN
+  parameter int          BPRED     = 2,       // 0 not-taken, 1 static BTFN, 2 bimodal
+  parameter int          BHT_BITS  = 8        // log2(branch history table entries)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -84,6 +85,7 @@ module rv_core #(
     logic [31:0] rs2_val;
     logic [31:0] imm;
     logic        pred_taken;   // decode predicted taken and already redirected
+    logic [BHT_BITS-1:0] bht_idx;  // table entry used for the prediction
     ctrl_t       c;
   } idex_t;
 
@@ -268,6 +270,14 @@ module rv_core #(
     else                                  target_ex = ex.pc + ex.imm;
   end
 
+  // Train the branch history table with the resolved outcome
+  always_ff @(posedge clk) begin
+    if (BPRED >= 2 && !rst && !halted && ex.valid && ex.c.is_branch) begin
+      if (br_cond && bht[ex.bht_idx] != 2'b11)       bht[ex.bht_idx] <= bht[ex.bht_idx] + 2'd1;
+      else if (!br_cond && bht[ex.bht_idx] != 2'b00) bht[ex.bht_idx] <= bht[ex.bht_idx] - 2'd1;
+    end
+  end
+
   // -------------------------------------------------------------------------
   // Performance events, counted in hpmcounter3..9 (events are hardwired, so
   // the mhpmevent selectors are not implemented).
@@ -297,7 +307,7 @@ module rv_core #(
   // Read-only configuration register in the custom machine CSR space, so
   // software (tests, benchmarks) can tell which features this build has.
   //   [0]     JAL resolved in decode
-  //   [3:1]   branch predictor: 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
+  //   [3:1]   branch predictor: 0 not-taken, 1 BTFN, 2 bimodal
   //   [11:4]  return-address stack depth (0 = none)
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
@@ -359,11 +369,23 @@ module rv_core #(
   // prediction was wrong (1-cycle penalty either way).
   //   BPRED 0: always not-taken
   //   BPRED 1: static BTFN - backward branches (loops) taken, forward not
+  //   BPRED 2: bimodal - 2^BHT_BITS two-bit saturating counters indexed by
+  //            pc, read in ID and trained in EX with the real outcome
+  //
+  // No repair logic is needed: a branch resolves in EX while the instruction
+  // after it is in ID, so nothing past a branch ever executes before the
+  // branch is resolved, and the table is only trained by real branches.
   // -------------------------------------------------------------------------
+  logic [1:0] bht [2**BHT_BITS];
+  initial for (int i = 0; i < 2**BHT_BITS; i++) bht[i] = 2'b01;   // weakly not-taken
+
+  wire [BHT_BITS-1:0] bht_idx_d = pc_d[BHT_BITS+1:2];
+
   logic pred_taken_d;
   always_comb begin
     unique case (BPRED)
-      1:       pred_taken_d = imm_b[31];      // negative offset = backward
+      1:       pred_taken_d = imm_b[31];             // negative offset = backward
+      2:       pred_taken_d = bht[bht_idx_d][1];     // counter's MSB
       default: pred_taken_d = 1'b0;
     endcase
     pred_taken_d = pred_taken_d && c_d.is_branch;
@@ -438,6 +460,7 @@ module rv_core #(
         ex.rs2_val <= rf_rd2;
         ex.imm        <= imm_d;
         ex.pred_taken <= pred_taken_d;
+        ex.bht_idx    <= bht_idx_d;
         ex.c          <= c_d;
         if (c_d.trap) halt_fetch <= 1'b1;
       end
