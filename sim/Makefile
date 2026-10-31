@@ -11,9 +11,10 @@ OBJ ?= obj_dir
 
 # Core configuration (defaults match the RTL defaults)
 EARLY_JAL ?= 1
-BPRED     ?= 2
+BPRED     ?= 3
 BHT_BITS  ?= 8
-PARAMS = -GEARLY_JAL=$(EARLY_JAL) -GBPRED=$(BPRED) -GBHT_BITS=$(BHT_BITS)
+GHR_BITS  ?= 8
+PARAMS = -GEARLY_JAL=$(EARLY_JAL) -GBPRED=$(BPRED) -GBHT_BITS=$(BHT_BITS) -GGHR_BITS=$(GHR_BITS)
 VFLAGS = --cc --exe --build -j 0 -O3 --trace -Wall -Wno-fatal \
          -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM \
          -I$(RTL_DIR) +define+SIMULATION --top-module rv_soc \

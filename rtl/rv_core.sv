@@ -27,8 +27,9 @@
 module rv_core #(
   parameter logic [31:0] RESET_PC  = 32'h0000_0000,
   parameter bit          EARLY_JAL = 1'b1,    // resolve JAL in decode (0-cycle penalty)
-  parameter int          BPRED     = 2,       // 0 not-taken, 1 static BTFN, 2 bimodal
-  parameter int          BHT_BITS  = 8        // log2(branch history table entries)
+  parameter int          BPRED     = 3,       // 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
+  parameter int          BHT_BITS  = 8,       // log2(branch history table entries)
+  parameter int          GHR_BITS  = 8        // gshare global history length
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -270,11 +271,14 @@ module rv_core #(
     else                                  target_ex = ex.pc + ex.imm;
   end
 
-  // Train the branch history table with the resolved outcome
+  // Train the branch history table and shift the outcome into the history
   always_ff @(posedge clk) begin
-    if (BPRED >= 2 && !rst && !halted && ex.valid && ex.c.is_branch) begin
+    if (rst) begin
+      ghr <= '0;
+    end else if (BPRED >= 2 && !halted && ex.valid && ex.c.is_branch) begin
       if (br_cond && bht[ex.bht_idx] != 2'b11)       bht[ex.bht_idx] <= bht[ex.bht_idx] + 2'd1;
       else if (!br_cond && bht[ex.bht_idx] != 2'b00) bht[ex.bht_idx] <= bht[ex.bht_idx] - 2'd1;
+      ghr <= {ghr[GHR_BITS-2:0], br_cond};
     end
   end
 
@@ -307,7 +311,7 @@ module rv_core #(
   // Read-only configuration register in the custom machine CSR space, so
   // software (tests, benchmarks) can tell which features this build has.
   //   [0]     JAL resolved in decode
-  //   [3:1]   branch predictor: 0 not-taken, 1 BTFN, 2 bimodal
+  //   [3:1]   branch predictor: 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
   //   [11:4]  return-address stack depth (0 = none)
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
@@ -371,6 +375,12 @@ module rv_core #(
   //   BPRED 1: static BTFN - backward branches (loops) taken, forward not
   //   BPRED 2: bimodal - 2^BHT_BITS two-bit saturating counters indexed by
   //            pc, read in ID and trained in EX with the real outcome
+  //   BPRED 3: gshare - same table, indexed by pc XOR the global history of
+  //            the last GHR_BITS branch outcomes, so one branch gets separate
+  //            counters for different paths leading to it. The history is
+  //            updated in EX with real outcomes (non-speculatively), so a
+  //            branch decoded right behind another branch doesn't see that
+  //            branch's outcome yet.
   //
   // No repair logic is needed: a branch resolves in EX while the instruction
   // after it is in ID, so nothing past a branch ever executes before the
@@ -379,13 +389,23 @@ module rv_core #(
   logic [1:0] bht [2**BHT_BITS];
   initial for (int i = 0; i < 2**BHT_BITS; i++) bht[i] = 2'b01;   // weakly not-taken
 
-  wire [BHT_BITS-1:0] bht_idx_d = pc_d[BHT_BITS+1:2];
+  logic [GHR_BITS-1:0] ghr;
+
+  // Fold the history down (or zero-extend it) to the table index width
+  function automatic logic [BHT_BITS-1:0] fold_ghr(input logic [GHR_BITS-1:0] h);
+    logic [BHT_BITS-1:0] f = '0;
+    for (int i = 0; i < GHR_BITS; i++) f[i % BHT_BITS] ^= h[i];
+    return f;
+  endfunction
+
+  wire [BHT_BITS-1:0] bht_idx_d = (BPRED == 3) ? (pc_d[BHT_BITS+1:2] ^ fold_ghr(ghr))
+                                               : pc_d[BHT_BITS+1:2];
 
   logic pred_taken_d;
   always_comb begin
     unique case (BPRED)
       1:       pred_taken_d = imm_b[31];             // negative offset = backward
-      2:       pred_taken_d = bht[bht_idx_d][1];     // counter's MSB
+      2, 3:    pred_taken_d = bht[bht_idx_d][1];     // counter's MSB
       default: pred_taken_d = 1'b0;
     endcase
     pred_taken_d = pred_taken_d && c_d.is_branch;
