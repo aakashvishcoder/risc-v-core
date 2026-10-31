@@ -29,9 +29,9 @@ module rv_soc #(
   parameter int    IBTB_BITS    = 4,
   parameter int    M_EXT        = 2,
   parameter int    CACHES       = 0,       // memory system: see above
-  parameter int    IC_LINES     = 64,      // I-cache lines (16 B each)
+  parameter int    IC_LINES     = 128,     // I-cache lines (16 B each): 2 KiB
   parameter int    DC_SETS      = 64,      // D-cache sets, 0 = no D-cache
-  parameter int    DC_WAYS      = 1,       // D-cache ways (1 or 2); lines are 16 B
+  parameter int    DC_WAYS      = 2,       // D-cache ways (1 or 2); lines are 16 B: 2 KiB
   parameter int    MEM_LATENCY  = 20       // main memory latency (CACHES = 1)
 ) (
   input  logic        clk,

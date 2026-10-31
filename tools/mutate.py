@@ -10,8 +10,10 @@ and checked two ways:
   - sw/mext checks spec-defined multiply/divide results directly
   - perftest catches performance bugs: the design still computes the right
     answers, so co-simulation can't see them, but event counts are off
-A mutant is "killed" if either check fails. A surviving mutant means a hole
-in the tests (or an equivalent mutant that doesn't change behavior).
+  - sw/cachetest checks exact miss/writeback counts and data integrity
+A mutant is "killed" if any check fails. A surviving mutant means a hole in
+the tests (or an equivalent mutant that doesn't change behavior). Mutants of
+the memory system are built with caches in front of slow main memory.
 
 The real rtl/ directory is never modified.
 
@@ -26,7 +28,9 @@ import tempfile
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
-# (name, file, original text, mutated text)
+CACHED = "CACHES=1"   # build setting for memory-system mutants
+
+# (name, file, original text, mutated text[, build settings])
 MUTANTS = [
     ("no MEM->EX forwarding", "rv_core.sv",
      "if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)",
@@ -139,6 +143,42 @@ MUTANTS = [
       done     <= (b == 32'b0);   // divide by zero: result is ready now""",
      """      busy     <= 1'b1;
       done     <= 1'b0;"""),
+    # --- caches: functional ---
+    ("D-cache dirty bit never set", "rv_dcache.sv",
+     "if (store_hit) dirty[hit_way][idx] <= 1'b1;",
+     "", CACHED),
+    ("D-cache writes back to the missing address", "rv_dcache.sv",
+     "assign mem_addr  = (state == WRITEBACK) ? {tags[victim][idx], idx, 4'b0} : {addr[31:4], 4'b0};",
+     "assign mem_addr  = {addr[31:4], 4'b0};", CACHED),
+    ("D-cache hit ignores the valid bit", "rv_dcache.sv",
+     "hit_w[w] = valid[w][idx] && (tags[w][idx] == tag);",
+     "hit_w[w] = (tags[w][idx] == tag);", CACHED),
+    ("D-cache refills over a dirty victim", "rv_dcache.sv",
+     "state  <= (valid[lru_way][idx] && dirty[lru_way][idx]) ? WRITEBACK : FILL;",
+     "state  <= FILL;", CACHED),
+    ("D-cache store hit writes way 0", "rv_dcache.sv",
+     "end else if (store_hit && hit_way == WB_'(w)) begin",
+     "end else if (store_hit && w == 0) begin", CACHED),
+    ("D-cache load word from the wrong way", "rv_dcache.sv",
+     "assign rdata = data_q[way_q][32*off_q +: 32];",
+     "assign rdata = data_q[hit_way][32*off_q +: 32];", CACHED),
+    ("I-cache hit ignores the tag", "rv_icache.sv",
+     "assign hit   = valid_q && (tag_q == pc_id[31:IB+4]);",
+     "assign hit   = valid_q;", CACHED),
+    ("I-cache miss still decoded", "rv_core.sv",
+     "wire        valid_i = valid_d && imem_valid;",
+     "wire        valid_i = valid_d;", CACHED),
+    ("EX operands not refreshed during a stall", "rv_core.sv",
+     """        ex.rs1_val <= a_fwd;
+        ex.rs2_val <= b_fwd;""",
+     "", CACHED),
+    # --- caches: performance only ---
+    ("D-cache LRU never updated", "rv_dcache.sv",
+     "if (WAYS > 1 && req && hit) lru[idx] <= !hit_way[0];",
+     "", CACHED),
+    ("load-use also counted during a cache stall", "rv_core.sv",
+     "assign perf_ev[0] = valid_i && load_use && !redirect_ex && !ex_stall && !halt_fetch;",
+     "assign perf_ev[0] = valid_i && load_use && !redirect_ex && !halt_fetch;", CACHED),
 ]
 
 RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_divider.sv", "rv_regfile.sv", "rv_core.sv",
@@ -158,14 +198,16 @@ def main():
     args = ap.parse_args()
 
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    for prog in ("perftest", "mext"):
+    for prog in ("perftest", "mext", "cachetest"):
         if run(f"make -s -C {ROOT}/sw PROG={prog}").returncode != 0:
             sys.exit(f"could not build {prog}")
     perftest = f"{ROOT}/sw/build/perftest.hex"
     mext = f"{ROOT}/sw/build/mext.hex"
+    cachetest = f"{ROOT}/sw/build/cachetest.hex"
     killed = 0
     mutants = [m for m in MUTANTS if not args.only or args.only in m[0]]
-    for name, fname, old, new in mutants:
+    for name, fname, old, new, *cfg in mutants:
+        cfg = cfg[0] if cfg else ""
         os.makedirs(os.path.join(ROOT, "out"), exist_ok=True)
         work = tempfile.mkdtemp(prefix="mut_", dir=os.path.join(ROOT, "out"))
         try:
@@ -181,7 +223,7 @@ def main():
             open(path, "w").write(src.replace(old, new))
 
             obj = os.path.join(work, "obj")
-            b = run(f"make -s -C {ROOT}/sim RTL_DIR={rtl} OBJ={obj}")
+            b = run(f"make -s -C {ROOT}/sim RTL_DIR={rtl} OBJ={obj} {cfg}")
             if b.returncode != 0:
                 print(f"  ERROR    {name}: build failed\n{b.stdout}{b.stderr}")
                 continue
@@ -193,11 +235,14 @@ def main():
             perf_fail = p.returncode != 0 or "perftest: 0 failures" not in p.stdout
             m = run(f"{obj}/Vrv_soc +firmware={mext} +max_cycles=2000000")
             mext_fail = m.returncode != 0 or ", 0 failures" not in m.stdout
-            dead = failed > 0 or perf_fail or mext_fail
+            c = run(f"{obj}/Vrv_soc +firmware={cachetest} +max_cycles=5000000")
+            cache_fail = c.returncode != 0 or "cachetest: 0 failures" not in c.stdout
+            dead = failed > 0 or perf_fail or mext_fail or cache_fail
             killed += dead
+            f = lambda x: "FAIL" if x else "pass"
             print(f"  {'KILLED' if dead else 'SURVIVED':8} {name:46} "
-                  f"random {failed:2}/{args.seeds}  perftest {'FAIL' if perf_fail else 'pass'}"
-                  f"  mext {'FAIL' if mext_fail else 'pass'}")
+                  f"random {failed:2}/{args.seeds}  perftest {f(perf_fail)}  mext {f(mext_fail)}"
+                  f"  cachetest {f(cache_fail)}")
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
