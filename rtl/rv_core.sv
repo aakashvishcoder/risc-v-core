@@ -13,9 +13,9 @@
 //   - Data   : full forwarding from MEM and WB into EX; regfile write-through
 //              covers WB -> ID. A load followed by a dependent instruction
 //              stalls one cycle (load-use).
-//   - Control: predict not-taken. Branches and JALR resolve in EX; a taken
-//              branch or a JALR flushes the instruction in ID (1-cycle
-//              penalty). JAL's target is pc + imm, known as soon as it's
+//   - Control: branches are predicted in ID (see BPRED) and resolve in EX;
+//              a misprediction or a JALR flushes the instruction in ID
+//              (1-cycle penalty). JAL's target is pc + imm, known as soon as it's
 //              decoded, so with EARLY_JAL decode redirects fetch directly.
 //              Because IF is only an address phase, a redirect from ID costs
 //              nothing: the next address is chosen in the same cycle.
@@ -26,7 +26,8 @@
 // ---------------------------------------------------------------------------
 module rv_core #(
   parameter logic [31:0] RESET_PC  = 32'h0000_0000,
-  parameter bit          EARLY_JAL = 1'b1     // resolve JAL in decode (0-cycle penalty)
+  parameter bit          EARLY_JAL = 1'b1,    // resolve JAL in decode (0-cycle penalty)
+  parameter int          BPRED     = 1        // 0 predict not-taken, 1 static BTFN
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -300,7 +301,7 @@ module rv_core #(
   //   [11:4]  return-address stack depth (0 = none)
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
-  wire [31:0] mconfig = {31'b0, EARLY_JAL};
+  wire [31:0] mconfig = {28'b0, 3'(BPRED), EARLY_JAL};
 
   // CSR reads (read-only counters)
   logic [31:0] csr_val;
@@ -351,9 +352,26 @@ module rv_core #(
   // -------------------------------------------------------------------------
   // Fetch PC
   // -------------------------------------------------------------------------
-  // Decode-stage redirect: follow a JAL as soon as it's decoded
-  wire        redirect_id = EARLY_JAL && c_d.is_jal;
-  wire [31:0] target_id   = pc_d + imm_j;
+  // -------------------------------------------------------------------------
+  // Branch prediction (decode stage)
+  // A branch predicted taken redirects fetch to pc + imm straight from ID, for
+  // free; EX checks the real outcome and redirects to the right path if the
+  // prediction was wrong (1-cycle penalty either way).
+  //   BPRED 0: always not-taken
+  //   BPRED 1: static BTFN - backward branches (loops) taken, forward not
+  // -------------------------------------------------------------------------
+  logic pred_taken_d;
+  always_comb begin
+    unique case (BPRED)
+      1:       pred_taken_d = imm_b[31];      // negative offset = backward
+      default: pred_taken_d = 1'b0;
+    endcase
+    pred_taken_d = pred_taken_d && c_d.is_branch;
+  end
+
+  // Decode-stage redirect: follow a JAL, or a branch predicted taken
+  wire        redirect_id = (EARLY_JAL && c_d.is_jal) || pred_taken_d;
+  wire [31:0] target_id   = pc_d + (c_d.is_jal ? imm_j : imm_b);
 
   wire stall_d = load_use || halt_fetch;
   logic [31:0] fetch_pc;
@@ -419,7 +437,7 @@ module rv_core #(
         ex.rs1_val <= rf_rd1;
         ex.rs2_val <= rf_rd2;
         ex.imm        <= imm_d;
-        ex.pred_taken <= 1'b0;
+        ex.pred_taken <= pred_taken_d;
         ex.c          <= c_d;
         if (c_d.trap) halt_fetch <= 1'b1;
       end
