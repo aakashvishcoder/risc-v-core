@@ -102,14 +102,14 @@ static struct range alt_misp(const struct cfg *c) {
   }
 }
 
-// Jump redirects for N calls (JAL) + N returns (JALR)
+// Jump redirects for 2N calls (JAL) + 2N returns (JALR) from two call sites
 static struct range call_ret_redirects(const struct cfg *c) {
-  struct range jal = EXACT(c->early_jal ? 0 : N);
+  struct range jal = EXACT(c->early_jal ? 0 : 2 * N);
   // Calls and returns are balanced, so every return pops exactly the address
   // its call pushed, whatever was on the stack before: no misses at all.
-  struct range ret = c->ras_depth ? EXACT(0)
-                   : c->ibtb_bits ? (struct range){0, 2}
-                   : EXACT(N);
+  // Without a stack, the target buffer predicts the previous return's target,
+  // which is always the other call site.
+  struct range ret = c->ras_depth ? EXACT(0) : EXACT(2 * N);
   return radd(jal, ret);
 }
 
@@ -135,7 +135,7 @@ int main(void) {
     {"k1 load-use",         k1, 4 * N,          N,     N,     N - 1,           0, 0, 0, loop_misp(&c), none},
     {"k2 load + gap",       k2, 4 * N,          0,     N,     N - 1,           0, 0, 0, loop_misp(&c), none},
     {"k3 rs2 / store data", k3, 6 * N,          2 * N, N,     N - 1,           0, 0, 0, loop_misp(&c), none},
-    {"k4 call / return",    k4, 5 * N,          0,     N,     N - 1,           2 * N, 0, 0, loop_misp(&c), call_ret_redirects(&c)},
+    {"k4 call / return",    k4, 8 * N,          0,     N,     N - 1,           4 * N, 0, 0, loop_misp(&c), call_ret_redirects(&c)},
     {"k5 load to x0",       k5, 4 * N,          0,     N,     N - 1,           0, 0, 0, loop_misp(&c), none},
     {"k6 never taken",      k6, 4 * N,          0,     2 * N, N - 1,           0, 0, 0, radd(loop_misp(&c), never_misp(&c)), none},
     {"k7 alternating",      k7, 5 * N - N / 2,  0,     2 * N, N - 1 + N / 2,   0, 0, 0, radd(loop_misp(&c), alt_misp(&c)), none},

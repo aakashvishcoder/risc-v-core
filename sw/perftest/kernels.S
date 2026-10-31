@@ -150,13 +150,17 @@ k3:
     DIFF
     EPILOGUE
 
-# k4: call / return in a loop (500 instructions).
+# k4: calls to one function from two call sites, alternating (800
+# instructions). Its return goes back to a different place every time, so
+# only a return-address stack predicts it; a target buffer, which remembers
+# the last target, is always wrong.
     .globl k4
 k4:
     PROLOGUE
     li   t3, N
     SNAP
 1:  jal  ra, leaf
+    jal  ra, leaf
     addi t3, t3, -1
     bnez t3, 1b
     DIFF
