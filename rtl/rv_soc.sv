@@ -7,6 +7,7 @@
 //   0x1000_0004  UART_STAT  R  : bit0 = transmitter busy
 //   0x1000_0008  SIM_EXIT   W  : end simulation with exit code (testbench)
 //   0x1000_000C  LEDS       RW : LED outputs
+// Any other data address raises an access fault in the core.
 //
 // Memory system
 //   CACHES = 0: the core talks to a dual-port block RAM directly; every access
@@ -38,7 +39,6 @@ module rv_soc #(
   input  logic        rst,
   output logic        uart_txd,
   output logic [7:0]  leds,
-  output logic        halted,
 
   // Simulation / debug visibility
   output logic        tx_valid,      // a byte was written to UART_DATA
@@ -50,7 +50,10 @@ module rv_soc #(
   output logic [31:0] commit_instr,
   output logic        commit_rd_we,
   output logic [4:0]  commit_rd,
-  output logic [31:0] commit_rd_val
+  output logic [31:0] commit_rd_val,
+  output logic        commit_trap,
+  output logic [31:0] commit_cause,
+  output logic [31:0] commit_tval
 );
   localparam int AW = $clog2(MEM_WORDS);
   localparam logic [31:0] MCACHE = (CACHES == 0) ? 32'b0 :
@@ -67,7 +70,8 @@ module rv_soc #(
 
   rv_core #(
     .EARLY_JAL (EARLY_JAL != 0), .BPRED (BPRED), .BHT_BITS (BHT_BITS), .GHR_BITS (GHR_BITS),
-    .RAS_DEPTH (RAS_DEPTH), .IBTB_BITS (IBTB_BITS), .M_EXT (M_EXT), .MCACHE (MCACHE)
+    .RAS_DEPTH (RAS_DEPTH), .IBTB_BITS (IBTB_BITS), .M_EXT (M_EXT), .MCACHE (MCACHE),
+    .RAM_BYTES (4 * MEM_WORDS)
   ) u_core (
     .clk, .rst,
     .imem_addr, .imem_rdata, .imem_pc, .imem_valid, .imem_lookup, .imem_kill,
@@ -75,11 +79,11 @@ module rv_soc #(
     .ev_icache_miss, .ev_dcache_miss, .ev_dcache_wb,
     .commit_valid, .commit_pc, .commit_instr,
     .commit_rd_we, .commit_rd, .commit_rd_val,
-    .halted
+    .commit_trap, .commit_cause, .commit_tval
   );
 
-  wire sel_ram = (dmem_addr[31:28] == 4'h0);
-  wire sel_io  = (dmem_addr[31:28] == 4'h1);
+  wire sel_ram = (dmem_addr[31:AW+2] == '0);
+  wire sel_io  = (dmem_addr[31:8] == 24'h10_0000);
   wire ram_acc = sel_ram && (dmem_re || dmem_we != 4'b0);   // EX has a RAM access
 
   logic [31:0] ram_rdata;

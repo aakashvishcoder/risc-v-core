@@ -130,8 +130,8 @@ MUTANTS = [
      "wire div_stall   = div_pending && !(div_issued && div_done);",
      "wire div_stall   = 1'b0;"),
     ("no MEM bubbles while dividing", "rv_core.sv",
-     "mem.valid   <= ex.valid && !ex_stall;",
-     "mem.valid   <= ex.valid;"),
+     "mem.valid   <= ex_live && !ex_stall;",
+     "mem.valid   <= ex_live;"),
     ("divide by zero returns 0", "rv_divider.sv",
      "result = want_rem ? dividend : 32'hFFFF_FFFF;",
      "result = want_rem ? dividend : 32'h0;"),
@@ -167,7 +167,7 @@ MUTANTS = [
      "assign hit   = valid_q && (tag_q == pc_id[31:IB+4]);",
      "assign hit   = valid_q;", CACHED),
     ("I-cache miss still decoded", "rv_core.sv",
-     "wire        valid_i = valid_d && imem_valid;",
+     "wire        valid_i = valid_d && !fetch_miss;",
      "wire        valid_i = valid_d;", CACHED),
     ("EX operands not refreshed during a stall", "rv_core.sv",
      """        ex.rs1_val <= a_fwd;
@@ -178,8 +178,8 @@ MUTANTS = [
      "if (WAYS > 1 && req && hit) lru[idx] <= !hit_way[0];",
      "", CACHED),
     ("load-use also counted during a cache stall", "rv_core.sv",
-     "assign perf_ev[0] = valid_i && load_use && !redirect_ex && !ex_stall && !halt_fetch;",
-     "assign perf_ev[0] = valid_i && load_use && !redirect_ex && !halt_fetch;", CACHED),
+     "assign perf_ev[0] = valid_i && load_use && !redirect_ex && !ex_stall;",
+     "assign perf_ev[0] = valid_i && load_use && !redirect_ex;", CACHED),
 ]
 
 RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_divider.sv", "rv_regfile.sv", "rv_core.sv",

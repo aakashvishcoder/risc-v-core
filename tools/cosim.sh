@@ -18,7 +18,7 @@ MAX_CYCLES="${MAX_CYCLES:-50000000}"
 export PYTHONDONTWRITEBYTECODE=1
 
 "$SIM" +firmware="$HEX" +trace="$OUT/$NAME.rtl" +max_cycles="$MAX_CYCLES" > "$OUT/$NAME.rtl.uart" 2> "$OUT/$NAME.rtl.log" || true
-python3 "$ROOT/tools/iss.py" "$HEX" --trace "$OUT/$NAME.ref" --csr-sync "$OUT/$NAME.rtl" --max "$MAX_CYCLES" --m "$@" \
+python3 "$ROOT/tools/iss.py" "$HEX" --trace "$OUT/$NAME.ref" --sync "$OUT/$NAME.rtl" --max "$MAX_CYCLES" --m "$@" \
   > "$OUT/$NAME.ref.uart" 2> "$OUT/$NAME.ref.log" || true
 
 printf '%-16s ' "$NAME"

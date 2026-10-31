@@ -20,7 +20,7 @@ sim:
 hello:
 	$(MAKE) -s -C sw PROG=hello
 
-PROGS = hello perftest mext cachetest coldload memstream
+PROGS = hello perftest mext cachetest coldload memstream traptest
 CACHE_SIM = sim/obj_cache/Vrv_soc
 progs:
 	@for p in $(PROGS); do $(MAKE) -s -C sw PROG=$$p || exit 1; done
@@ -71,7 +71,7 @@ cache-study: sim
 	@mkdir -p out
 	@for p in cm1/coremark memstream; do n=$$(basename $$p); \
 	  sim/obj_dir/Vrv_soc +firmware=sw/build/$$p.hex +trace=out/cs_$$n.rtl >/dev/null 2>&1; \
-	  PYTHONDONTWRITEBYTECODE=1 python3 tools/iss.py sw/build/$$p.hex --m --csr-sync out/cs_$$n.rtl \
+	  PYTHONDONTWRITEBYTECODE=1 python3 tools/iss.py sw/build/$$p.hex --m --sync out/cs_$$n.rtl \
 	    --mem-trace out/cs_$$n.mem >/dev/null 2>&1; \
 	  echo "=== $$n"; python3 tools/cache_study.py out/cs_$$n.rtl out/cs_$$n.mem $(CACHE_PEN); done
 
