@@ -142,7 +142,7 @@ MUTANTS = [
 ]
 
 RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_divider.sv", "rv_regfile.sv", "rv_core.sv",
-             "rv_ram.sv", "rv_mainmem.sv", "rv_icache.sv", "uart_tx.sv", "rv_soc.sv"]
+             "rv_ram.sv", "rv_mainmem.sv", "rv_icache.sv", "rv_dcache.sv", "uart_tx.sv", "rv_soc.sv"]
 
 
 def run(cmd, **kw):
