@@ -2,11 +2,12 @@
 #   make test        reference-model tests + directed programs + 100 random seeds
 #   make test-quick  same with 20 random seeds
 #   make mutate      mutation testing (slow, ~3 min)
+#   make bench       CoreMark (10 iterations) with the CPI stack
 SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: test test-quick mutate sim hello progs clean
+.PHONY: test test-quick mutate bench sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -23,11 +24,19 @@ test: sim progs
 	@PYTHONDONTWRITEBYTECODE=1 python3 tools/test_iss.py | tail -1
 	@echo "== directed programs (RTL vs reference model)"
 	@for p in $(PROGS); do tools/cosim.sh sw/build/$$p.hex || exit 1; done
+	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=1 BUILD=build/cm1
+	@mkdir -p out && cp sw/build/cm1/coremark.hex out/coremark_1iter.hex
+	@tools/cosim.sh out/coremark_1iter.hex
 	@echo "== random programs"
 	@tools/run_random.sh $(SEEDS) 1
 
 test-quick:
 	@$(MAKE) -s test SEEDS=20
+
+bench: sim
+	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=10
+	@sim/obj_dir/Vrv_soc +firmware=sw/build/coremark.hex 2>&1 | \
+	  sed -n '/^\[0\]crc/p; /^risc-v-core:/,$$p'
 
 mutate: sim
 	@python3 tools/mutate.py --seeds 20
