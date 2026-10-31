@@ -17,11 +17,15 @@ printing that took 232 cycles, 201 instructions
 [tb] stop: exit  code=0  cycles=956  retired=788  CPI=1.213  leds=0xa5
 ```
 
-| | Baseline pipeline | + branch prediction | + multiply/divide |
-|---|---|---|---|
-| CoreMark/MHz | 0.970 | 1.083 (+11.6%) | **2.372** (2.45× baseline) |
-| CPI | 1.164 | 1.043 | 1.140 |
-| Instructions (10 iterations) | 8.85M | 8.85M | 3.70M |
+| | Baseline pipeline | + branch prediction | + multiply/divide | + caches, slow memory |
+|---|---|---|---|---|
+| CoreMark/MHz | 0.970 | 1.082 (+11.6%) | **2.374** (2.45× baseline) | 2.205 |
+| CPI | 1.164 | 1.043 | 1.138 | 1.226 |
+| Instructions (10 iterations) | 8.85M | 8.85M | 3.70M | 3.70M |
+
+The first three columns use single-cycle on-chip RAM. The last puts a
+20-cycle main memory behind 2 KB instruction and data caches; they recover
+93% of the single-cycle performance.
 
 ## Roadmap
 
@@ -124,13 +128,26 @@ also mix in M instructions. Some bugs need both: a REM that takes the
 divisor's sign fails only 5 of 20 random seeds, but the directed test every
 time.
 
-**Every configuration.** `make test-configs` builds eleven configurations side
-by side, from the baseline pipeline up to full prediction with RV32IM, and
-runs the counter test, the M test (where the core has M), a co-simulated
-CoreMark iteration and random programs on each. Programs are compiled for
-each configuration's instruction set. One build has 4-entry tables, a 2-entry
-return-address stack and a 2-entry target buffer, so aliasing and overflow
-happen constantly.
+**Caches.** `sw/cachetest` checks exact miss and writeback counts derived
+from the cache geometry it reads from `mcache`: one miss per line from a
+clean cache, none on a re-read, one writeback per miss over dirty lines, W
+addresses in one set of a W-way cache (cold misses only) vs W+1 (LRU misses
+every time), and a 256-byte loop that runs with zero instruction misses once
+warm (or misses every line on every pass when the cache is smaller). It also
+writes and reads back two cache-sizes of data with word and byte stores.
+Random programs spread their data over 2 KB, more than the default data
+cache, so lines are evicted and written back constantly. `make test` runs
+everything on both single-cycle RAM and the cached memory system.
+
+**Every configuration.** `make test-configs` builds sixteen configurations,
+from the baseline pipeline up to full prediction with RV32IM, plus five
+memory systems (instruction cache only, 1 KB direct-mapped, 1 KB 2-way, the
+2 KB default, and 64-byte caches), and runs the counter test, the cache test,
+the M test (where the core has M), a co-simulated CoreMark iteration and
+random programs on each. Programs are compiled for each configuration's
+instruction set. Two stress builds (4-entry predictor tables, 2-entry
+return-address stack and target buffer; 4-line caches) make aliasing,
+overflow and evictions happen constantly.
 
 **Mutation testing.** Passing tests only matter if they would fail on a broken
 design. `tools/mutate.py` (`make mutate`) injects realistic bugs, one at a
@@ -187,8 +204,8 @@ in `make test`.
 
 | Metric | Base pipeline (RV32I) | + branch prediction | + multiply/divide (RV32IM) |
 |---|---|---|---|
-| CoreMark/MHz | 0.970 | 1.083 | 2.372 |
-| CPI | 1.164 | 1.043 | 1.140 |
+| CoreMark/MHz | 0.970 | 1.082 | 2.374 |
+| CPI | 1.164 | 1.043 | 1.138 |
 
 (All with linker relaxation enabled; see below.)
 
@@ -247,15 +264,17 @@ clear next target:
 
 ```
 CPI stack (share of cycles):
-  retiring              3697411 (87.7%)
+  retiring              3697426 (87.7%)
   load-use stalls       336344 (7.9%)
   multiply-use stalls   94680 (2.2%)
   divider stalls        0 (0.0%)
-  branch/jump flushes   86632 (2.0%)
+  I-cache stalls        0 (0.0%)
+  D-cache stalls        0 (0.0%)
+  branch/jump flushes   82850 (1.9%)
   other                 0 (0.0%)
 Control flow:
   taken branches        313222 (50.5%)
-  mispredicted branches 59432 (9.5%)
+  mispredicted branches 55650 (8.9%)
 ```
 
 ### Branch prediction: study first, then hardware
@@ -289,10 +308,13 @@ CoreMark (10 iterations, RV32I) across configurations, from `make bench-configs`
 | Early JAL | 0.983 | 1.149 | 64.3% | 53.6% |
 | BTFN | 1.055 | 1.070 | 14.1% | 53.6% |
 | Bimodal | 1.061 | 1.064 | 10.1% | 53.6% |
-| gshare | 1.068 | 1.057 | 6.0% | 53.6% |
-| gshare + RAS | 1.081 | 1.045 | 6.0% | 15.7% |
-| gshare + target buffer | 1.075 | 1.050 | 6.0% | 31.1% |
-| **gshare + RAS + target buffer** | **1.083** | **1.043** | **6.0%** | **9.3%** |
+| gshare | 1.067 | 1.058 | 6.3% | 53.6% |
+| gshare + RAS | 1.080 | 1.045 | 6.3% | 15.7% |
+| gshare + target buffer | 1.075 | 1.051 | 6.3% | 31.1% |
+| **gshare + RAS + target buffer** | **1.082** | **1.043** | **6.3%** | **9.3%** |
+
+(gshare's rate moves by a few tenths of a percent between builds: adding
+code shifts branch addresses and changes which branches share counters.)
 
 What the data shows:
 - **Loop structure does most of the work.** Backward branches are taken 85%
@@ -315,20 +337,125 @@ What the data shows:
   and its loop branch share one counter and thrash it: 196 of 200
   mispredicted.
 
+### Caches: study first, then hardware
+
+The FPGA board has only on-chip RAM, where every access takes one cycle. To
+study a real memory hierarchy, `CACHES=1` replaces it with a behavioral main
+memory that takes `MEM_LATENCY` (default 20) cycles per 16-byte line, which
+stands in for off-chip DRAM, or for the board's SPI flash read in place. In
+front of it sit an instruction cache and a write-back, write-allocate data
+cache.
+
+**The study.** `make cache-study` replays each program's fetch addresses
+(from the commit trace) and load/store addresses (from the reference model)
+through LRU set-associative cache models. CoreMark's data set is only about
+2 KB, so `sw/memstream` adds what CoreMark doesn't have: a 16 KB stream, a
+64-byte stride, two arrays exactly 8 KB apart read alternately, a 16 KB copy,
+and a pointer chase. The study showed:
+
+- For CoreMark the instruction side matters most: a 1 KB instruction cache
+  misses 1.70% of fetches, 2 KB 0.60%.
+- On the data side, associativity beats size: at 1 KB a 2-way cache misses
+  half as often as a direct-mapped one (0.72% vs 1.48% on CoreMark). Many
+  direct-mapped misses are conflicts, not capacity.
+- Longer lines (32 bytes) hurt small caches, where they leave fewer lines,
+  and only help at 8 KB.
+
+So the default is a **2 KB direct-mapped instruction cache and a 2 KB 2-way
+data cache.**
+
+**Miss penalties**, from the RTL (main memory latency L): an instruction or
+clean data miss costs L + 4 cycles, and a dirty victim adds L + 3 for the
+writeback. With those penalties the study's cycle estimates track the
+hardware closely:
+
+| 1 KB I + 1 KB D, whole program | Study estimate | Hardware | Difference |
+|---|---|---|---|
+| CoreMark, direct-mapped D | 689,435 | 695,544 | +0.9% |
+| CoreMark, 2-way D | 664,718 | 670,536 | +0.9% |
+| memstream, direct-mapped D | 948,000 | 948,344 | +0.04% |
+| memstream, 2-way D | 583,872 | 584,182 | +0.05% |
+
+memstream matches almost exactly. CoreMark's 0.9% comes from interactions
+the trace model ignores: an instruction fill waiting behind a data miss for
+the single memory port, and load-use stalls hidden by fetch bubbles.
+
+**What 2-way buys** (memstream, cycles per kernel):
+
+| Kernel | 1 KB + 1 KB direct-mapped | 2 KB + 2 KB 2-way | Why |
+|---|---|---|---|
+| stream | 42,498 | 43,970 | one miss per line either way |
+| stride | 7,302 | 7,302 | every access misses either way |
+| conflict | 225,765 | 78,309 | direct-mapped thrashes: 8,192 misses vs 2,048 |
+| copy | 322,340 | 104,228 | source and destination collide: 8,192 misses vs 2,048 |
+| chase | 95,174 | 75,073 | more of the 4 KB ring stays cached |
+
+**CoreMark across memory systems** (10 iterations, full predictor + RV32IM,
+20-cycle main memory), from `make bench-configs`:
+
+| Memory system | CoreMark/MHz | CPI | I-cache stalls | D-cache stalls |
+|---|---|---|---|---|
+| Single-cycle on-chip RAM (no caches) | 2.374 | 1.138 | – | – |
+| 1 KB I-cache, no D-cache | 0.379 | 7.118 | 4.7% | 79.2% |
+| 1 KB I + 1 KB direct-mapped D | 1.715 | 1.576 | 22.0% | 5.7% |
+| 1 KB I + 1 KB 2-way D | 1.777 | 1.521 | 22.8% | 2.3% |
+| **2 KB I + 2 KB 2-way D (default)** | **2.205** | **1.226** | **6.5%** | **0.6%** |
+| 64 B I + 64 B 2-way D (stress test) | 0.314 | 8.612 | 50.7% | 36.0% |
+
+- Without a data cache, 79% of all cycles wait on memory; adding one is a
+  4.5× speedup.
+- CoreMark's data fits easily, so after that the instruction cache is the
+  bottleneck (22% of cycles at 1 KB). Doubling it to 2 KB cuts instruction
+  stalls to 6.5%, exactly the lever the study pointed to.
+
+### Cache design
+
+- **Same hit timing as the on-chip RAM.** The instruction cache reads tag and
+  data with the fetch address and compares in decode; the data cache reads
+  tags asynchronously in execute (hit or miss is known there) and data
+  synchronously, so a load's word is ready in the memory stage. A hit costs
+  nothing extra, so `CACHES=1` with no misses runs exactly like `CACHES=0`.
+- **An instruction miss empties decode**, and the core refetches the same PC
+  until the line arrives; the fill is written with a bypass so the refetch
+  sees it immediately. Hits keep being served while a fill is in flight, and
+  a miss on a fetch that execute is about to flush doesn't start a fill.
+- **A data miss holds execute**, like a divide. If the victim line (the
+  set's least recently used way) is dirty, it's written back first; then the
+  line is filled and the access retries. A store hit just writes its bytes
+  into the line and sets the dirty bit.
+- **One main-memory port**, shared by both caches; the data side (the older
+  instruction) wins.
+- **A bug the caches exposed.** While execute waits on a miss, the
+  instructions it forwards from keep moving and leave the pipeline, after
+  which execute would fall back to the stale register values it read in
+  decode. Co-simulation caught the wrong load addresses this caused. The fix
+  refreshes execute's saved operands from the forwarding network every stall
+  cycle. (The divider never hit it: it latches its operands on its first
+  cycle.)
+- **Exact cycle accounting survives.** Every lost cycle still has exactly
+  one cause: a load waiting on a miss counts as a cache stall, not also as a
+  load-use stall for the instruction behind it. And a load-use stall can
+  legitimately disappear: if the dependent instruction's own fetch misses,
+  it arrives after the load has moved on. `perftest` allows exactly that,
+  bounded by the instruction-cache stall cycles.
+- **Not implemented:** `FENCE.I` (no program here writes code at run time),
+  and counters can't be frozen atomically for measurement (`mcountinhibit`
+  needs CSR writes, coming with traps).
+
 ### Multiply and divide
 
 | Configuration (with full prediction) | CoreMark/MHz | CPI | Instructions | Branches mispredicted |
 |---|---|---|---|---|
-| RV32I (software multiply/divide) | 1.083 | 1.043 | 8.85M | 6.0% |
-| + multiplier (Zmmul) | 2.372 | 1.139 | 3.70M | 9.5% |
-| + divider (full M) | 2.372 | 1.140 | 3.70M | 9.5% |
+| RV32I (software multiply/divide) | 1.082 | 1.043 | 8.85M | 6.3% |
+| + multiplier (Zmmul) | 2.374 | 1.138 | 3.70M | 8.9% |
+| + divider (full M) | 2.374 | 1.138 | 3.70M | 8.9% |
 
 - **The multiplier more than doubles performance (2.19×).** On RV32I every
   multiply is a call to a shift-and-add loop; that loop was 58% of every
   instruction CoreMark executed.
 - **CPI goes up, and that's expected.** The instructions that disappeared
   were cheap, predictable loop instructions, so the stalls that remain are a
-  bigger share of fewer cycles. Branch misprediction rises from 6.0% to 9.5%
+  bigger share of fewer cycles. Branch misprediction rises from 6.3% to 8.9%
   for the same reason: the multiply loop's branches were easy to predict, and
   what's left is CoreMark's real control flow.
 - **The divider doesn't change CoreMark at all**, because its timed region
@@ -398,3 +525,6 @@ All prediction happens in decode, and all of it is checked in execute.
   prediction flushes the one instruction behind it (1-cycle penalty).
 - **Multiply** results are produced in MEM (like loads); a **divide** holds
   EX for 33 cycles.
+- **With caches**, an instruction-cache miss empties ID until the line
+  arrives, and a data-cache miss holds EX (like a divide); hits take exactly
+  the same time as the single-cycle RAM.
