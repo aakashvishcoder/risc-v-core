@@ -13,7 +13,7 @@ import sys
 import os
 
 sys.path.insert(0, os.path.dirname(__file__))
-from iss import ISS, Trap  # noqa: E402
+from iss import ISS, INTERRUPT  # noqa: E402
 
 M = 0xFFFFFFFF
 
@@ -182,16 +182,162 @@ def jalr_clears_bit0():
     sim = run(p)
     assert sim.pc == 0x20 and sim.x[1] == 12
 
+# ---- traps -----------------------------------------------------------------
+def csrrw(rd, csr, rs1):  return i(csr, rs1, 1, rd, 0x73)
+def csrrs(rd, csr, rs1):  return i(csr, rs1, 2, rd, 0x73)
+def csrrc(rd, csr, rs1):  return i(csr, rs1, 3, rd, 0x73)
+def csrrwi(rd, csr, z):   return i(csr, z, 5, rd, 0x73)
+def csrrsi(rd, csr, z):   return i(csr, z, 6, rd, 0x73)
+ECALL, EBREAK, MRET, WFI = 0x00000073, 0x00100073, 0x30200073, 0x10500073
+MSTATUS, MIE, MTVEC, MSCRATCH, MEPC, MCAUSE, MTVAL = \
+    0x300, 0x304, 0x305, 0x340, 0x341, 0x342, 0x343
+HANDLER = 0x100
+
+
+def trap_prog(body):
+    """Point mtvec at HANDLER, then run `body`. Returns the program image."""
+    p = li(31, HANDLER) + [csrrw(0, MTVEC, 31)] + body
+    return p + [0] * (HANDLER // 4 - len(p))
+
+
+def first_trap(body, steps=None):
+    """Run until the first trap and return (sim, mcause, mepc, mtval)."""
+    sim = ISS(trap_prog(body))
+    for _ in range(steps or 64):
+        if any(l.startswith("trap") for l in sim.step()):
+            return sim, sim.csr[MCAUSE], sim.csr[MEPC], sim.csr[MTVAL]
+    raise AssertionError("no trap")
+
+
 @test
 def illegal_instructions_trap():
     for ins in (0x00000000, 0xFFFFFFFF, r(1, 2, 1, 0, 3),   # mul without M
                 i(0, 0, 2, 0, 0x67),                       # jalr f3=2
-                r(0x20, 2, 1, 1, 3)):                      # "sub" with sll funct3
-        try:
-            run([ins])
-        except Trap:
-            continue
-        raise AssertionError(f"{ins:08x} should trap")
+                r(0x20, 2, 1, 1, 3),                       # "sub" with sll funct3
+                csrrs(1, 0x7C0, 0),                        # unimplemented CSR
+                csrrw(0, 0xC00, 1),                        # write to read-only cycle
+                csrrs(0, 0x301 | 0xC00, 1)):               # 0xF01-ish: read-only space
+        sim, cause, epc, tval = first_trap([ins])
+        assert cause == 2, f"{ins:08x}: mcause {cause}"
+        assert epc == 12 and tval == ins, f"{ins:08x}: mepc {epc:#x} mtval {tval:#x}"
+        assert sim.pc == HANDLER and sim.instret == 3   # faulting instruction didn't retire
+
+@test
+def csr_read_only_access_is_legal():
+    # csrrs rd, cycle, x0 reads without writing: legal on a read-only CSR
+    sim = run(trap_prog([csrrs(1, 0xC00, 0)]), steps=4)
+    assert sim.pc == 16 and sim.csr[MCAUSE] == 0
+
+@test
+def ecall_and_ebreak():
+    _, cause, epc, tval = first_trap([i(0, 0, 0, 0), ECALL])
+    assert (cause, epc, tval) == (11, 16, 0)
+    _, cause, epc, tval = first_trap([EBREAK])
+    assert (cause, epc, tval) == (3, 12, 12)   # tval = address of the ebreak
+
+@test
+def misaligned_loads_and_stores():
+    for ins, cause in ((i(1, 0, 2, 1, 0x03), 4),    # lw  from 0x201
+                       (i(1, 0, 1, 1, 0x03), 4),    # lh  from 0x201
+                       (s(2, 0, 0, 2), 6),          # sw  to   0x202
+                       (s(1, 0, 0, 1), 6)):         # sh  to   0x201
+        sim, c, epc, tval = first_trap([i(0x200, 0, 0, 0)] + [ins])   # x0 stays 0
+        # rs1 = x0: address is just the immediate
+        exp = (ins >> 20) if cause == 4 else (((ins >> 25) << 5) | ((ins >> 7) & 31))
+        assert c == cause and tval == exp, f"{ins:08x}: cause {c} tval {tval:#x}"
+    # byte accesses are never misaligned; aligned halfword is fine
+    sim = run(trap_prog([i(1, 0, 0, 1, 0x03), i(2, 0, 1, 1, 0x03)]), steps=5)
+    assert sim.csr[MCAUSE] == 0 and sim.pc == 20
+
+@test
+def access_faults_outside_the_memory_map():
+    _, c, _, tval = first_trap(li(5, 0x40000000) + [i(0, 5, 2, 1, 0x03)])
+    assert (c, tval) == (5, 0x40000000)
+    _, c, _, tval = first_trap(li(5, 0x10000100) + [s(0, 0, 5, 2)])   # just past IO
+    assert (c, tval) == (7, 0x10000100)
+    # jumping outside RAM faults on the fetch: mepc = mtval = the bad address
+    sim, c, epc, tval = first_trap(li(5, 0x20000000) + [i(0, 5, 0, 1, 0x67)])
+    assert (c, epc, tval) == (1, 0x20000000, 0x20000000)
+    assert sim.x[1] == 24              # the jalr (at 20) itself retired and linked
+
+@test
+def misaligned_jump_target():
+    # jalr to an address with bit 1 set: the jump traps, rd is not written
+    sim, c, epc, tval = first_trap(li(5, 0x22) + [i(0, 5, 0, 1, 0x67)])
+    assert (c, epc, tval) == (0, 20, 0x22) and sim.x[1] == 0
+    # taken branch to a misaligned target traps; not-taken does not
+    _, c, epc, tval = first_trap([b(6, 0, 0, 0)])          # beq x0,x0,+6
+    assert (c, epc, tval) == (0, 12, 18)
+    sim = run(trap_prog([b(6, 0, 0, 1), i(0, 0, 0, 0)]), steps=5)   # bne: not taken
+    assert sim.csr[MCAUSE] == 0 and sim.pc == 20
+
+@test
+def trap_updates_mstatus_and_mret_restores():
+    # MIE=1 before the trap: after it MIE=0, MPIE=1; mret brings MIE back
+    body = [csrrsi(0, MSTATUS, 8), ECALL]
+    p = trap_prog(body)
+    p += [csrrs(10, MSTATUS, 0),          # handler: x10 = mstatus in the handler
+          csrrs(11, MEPC, 0), i(4, 11, 0, 11), csrrw(0, MEPC, 11),   # mepc += 4
+          MRET]
+    sim = ISS(p)
+    for _ in range(5 + 5):         # 3 setup + csrrsi + ecall, then the handler
+        sim.step()
+    assert sim.x[10] == (1 << 7) | (3 << 11), hex(sim.x[10])   # MPIE=1, MIE=0, MPP=M
+    assert sim.pc == 20                                         # back after the ecall
+    assert sim.csr[MSTATUS] == (1 << 3) | (1 << 7) | (3 << 11)
+
+@test
+def csr_write_masks():
+    p = li(1, M) + [csrrw(0, MSTATUS, 1), csrrw(0, MIE, 1), csrrw(0, MEPC, 1),
+                    csrrw(0, MTVEC, 1), csrrw(0, MSCRATCH, 1), csrrw(0, 0x320, 1),
+                    csrrs(2, MSTATUS, 0), csrrs(3, MIE, 0), csrrs(4, MEPC, 0),
+                    csrrs(5, MTVEC, 0), csrrs(6, MSCRATCH, 0), csrrs(7, 0x320, 0)]
+    sim = run(p)
+    assert sim.x[2] == 0x1888          # only MIE, MPIE writable; MPP reads 11
+    assert sim.x[3] == 0x888           # MSIE, MTIE, MEIE
+    assert sim.x[4] == 0xFFFFFFFC      # mepc is 4-byte aligned
+    assert sim.x[5] == 0xFFFFFFFD      # mtvec mode 0/1 only
+    assert sim.x[6] == M
+    assert sim.x[7] == 0xFFFFFFFD      # mcountinhibit.TM hardwired 0
+
+@test
+def csr_set_clear_and_old_value():
+    p = li(1, 0xF0) + [csrrw(0, MSCRATCH, 1), csrrsi(2, MSCRATCH, 0x0F),
+                       csrrc(3, MSCRATCH, 1), csrrs(4, MSCRATCH, 0),
+                       csrrwi(5, MSCRATCH, 0x1F), csrrs(6, MSCRATCH, 0)]
+    sim = run(p)
+    assert (sim.x[2], sim.x[3], sim.x[4], sim.x[5], sim.x[6]) == (0xF0, 0xFF, 0x0F, 0x0F, 0x1F)
+
+@test
+def interrupts_direct_and_vectored():
+    # An interrupt injected before instruction 4 (the nop) is taken there:
+    # mepc = its pc, mtval = 0; in vectored mode it lands at BASE + 4*cause.
+    for mode in (0, 1):
+        p = li(31, HANDLER | mode) + [csrrw(0, MTVEC, 31), i(0, 0, 0, 0), i(0, 0, 0, 0)]
+        p += [0] * (HANDLER // 4 - len(p)) + [i(0, 0, 0, 0)] * 16
+        sim = ISS(p)
+        sim.irqs[4] = INTERRUPT | 7                   # machine timer
+        lines = []
+        for _ in range(5):
+            lines += sim.step()
+        assert lines[4] == "trap 80000007 pc=00000010 tval=00000000", lines
+        assert sim.csr[MEPC] == 16 and sim.csr[MCAUSE] == INTERRUPT | 7
+        exp = HANDLER + (4 * 7 if mode else 0) + 4    # handler's first instr executed
+        assert sim.pc == exp, (mode, hex(sim.pc))
+
+@test
+def wfi_is_a_nop():
+    sim = run(trap_prog([WFI, i(1, 0, 0, 1)]), steps=5)
+    assert sim.x[1] == 1 and sim.csr[MCAUSE] == 0
+
+@test
+def io_stores_use_byte_lane():
+    # sb of 0x41 to UART_DATA (offset 0) prints 'A'; ext-IRQ hook at 0x10 latches bit 0
+    p = li(5, 0x10000000) + [i(0x41, 0, 0, 1), s(0, 1, 5, 0), i(1, 0, 0, 2), s(0x10, 2, 5, 2),
+                             i(0x10, 5, 2, 3, 0x03)]
+    sim = run(p)
+    assert sim.out == [0x41] and sim.ext_irq == 1 and sim.x[3] == 1
+
 
 @test
 def m_extension_corner_cases():
