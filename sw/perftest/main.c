@@ -6,7 +6,9 @@
 // jumps) are checked exactly. Misprediction counts depend on which predictor
 // this build has (read from the mconfig CSR): they're exact for the
 // deterministic schemes and bounded for the dynamic ones, whose tables may
-// start warm or cold. Two identities are checked for every kernel:
+// start warm or cold. With very small tables, unrelated branches share
+// counters (destructive aliasing) and no useful bound exists, so misprediction
+// counts are only reported. Two identities are checked for every kernel:
 //   flush cycles = branch mispredictions + jump redirects
 //   cycles       = instructions + load-use stalls + flush cycles + constant
 #include "rt.h"
@@ -26,7 +28,7 @@ void k6(uint32_t d[NEV]);
 void k7(uint32_t d[NEV]);
 
 // mconfig layout (see rv_core.sv)
-struct cfg { int early_jal, bpred, ras_depth, ibtb_bits; };
+struct cfg { int early_jal, bpred, ras_depth, ibtb_bits, bht_bits, ghr_bits; };
 enum { BP_NOT_TAKEN, BP_BTFN, BP_BIMODAL, BP_GSHARE };
 static const char *bp_names[] = {"not-taken", "BTFN", "bimodal", "gshare"};
 
@@ -34,7 +36,7 @@ static struct cfg read_cfg(void) {
   uint32_t v;
   __asm__ volatile("csrr %0, 0xFC0" : "=r"(v));
   struct cfg c = {(int)(v & 1), (int)((v >> 1) & 7), (int)((v >> 4) & 0xFF),
-                  (int)((v >> 12) & 0xF)};
+                  (int)((v >> 12) & 0xF), (int)((v >> 16) & 0xF), (int)((v >> 20) & 0xF)};
   return c;
 }
 
@@ -44,8 +46,16 @@ static struct range radd(struct range a, struct range b) {
   return (struct range){a.lo + b.lo, a.hi + b.hi};
 }
 
+// Dynamic predictors with tables this small alias too much to bound
+#define MIN_BHT_BITS 6
+static int aliasing(const struct cfg *c) {
+  return c->bpred >= BP_BIMODAL && c->bht_bits < MIN_BHT_BITS;
+}
+#define ANY ((struct range){0, 0xFFFFFFFFu / 4})
+
 // Mispredictions of a counted loop's closing branch (taken N-1 times, then not)
 static struct range loop_misp(const struct cfg *c) {
+  if (aliasing(c)) return ANY;
   switch (c->bpred) {
     case BP_NOT_TAKEN: return EXACT(N - 1);
     case BP_BTFN:      return EXACT(1);                      // only the exit
@@ -56,6 +66,7 @@ static struct range loop_misp(const struct cfg *c) {
 
 // Mispredictions of a forward branch that is never taken
 static struct range never_misp(const struct cfg *c) {
+  if (aliasing(c)) return ANY;
   switch (c->bpred) {
     case BP_NOT_TAKEN:
     case BP_BTFN:      return EXACT(0);
@@ -66,6 +77,7 @@ static struct range never_misp(const struct cfg *c) {
 
 // Mispredictions of a forward branch alternating T/N (taken N/2 times)
 static struct range alt_misp(const struct cfg *c) {
+  if (aliasing(c)) return ANY;
   switch (c->bpred) {
     case BP_NOT_TAKEN:
     case BP_BTFN:      return EXACT(N / 2);                  // every taken one
@@ -77,7 +89,9 @@ static struct range alt_misp(const struct cfg *c) {
 // Jump redirects for N calls (JAL) + N returns (JALR)
 static struct range call_ret_redirects(const struct cfg *c) {
   struct range jal = EXACT(c->early_jal ? 0 : N);
-  struct range ret = c->ras_depth ? (struct range){0, 1}
+  // Calls and returns are balanced, so every return pops exactly the address
+  // its call pushed, whatever was on the stack before: no misses at all.
+  struct range ret = c->ras_depth ? EXACT(0)
                    : c->ibtb_bits ? (struct range){0, 2}
                    : EXACT(N);
   return radd(jal, ret);
@@ -93,8 +107,12 @@ struct test {
 
 int main(void) {
   struct cfg c = read_cfg();
-  printf_("perftest: early_jal=%d bpred=%s ras=%d ibtb_bits=%d\n", c.early_jal,
-          c.bpred < 4 ? bp_names[c.bpred] : "?", c.ras_depth, c.ibtb_bits);
+  printf_("perftest: early_jal=%d bpred=%s bht_bits=%d ghr_bits=%d ras=%d ibtb_bits=%d\n",
+          c.early_jal, c.bpred < 4 ? bp_names[c.bpred] : "?", c.bht_bits, c.ghr_bits,
+          c.ras_depth, c.ibtb_bits);
+  if (aliasing(&c))
+    printf_("  (tables under %d index bits alias: mispredicts reported, not bounded)\n",
+            MIN_BHT_BITS);
 
   struct range none = EXACT(0);
   const struct test tests[] = {

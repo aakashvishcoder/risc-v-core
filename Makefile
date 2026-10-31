@@ -1,14 +1,16 @@
 # Top-level convenience targets.
 #   make test        reference-model tests + directed programs + 100 random seeds
 #   make test-quick  same with 20 random seeds
-#   make mutate      mutation testing (slow, ~3 min)
+#   make test-configs  every predictor configuration: perftest, CoreMark, random (~4 min)
+#   make bench-configs same, plus CoreMark/MHz per configuration
+#   make mutate      mutation testing (slow, ~6 min)
 #   make bench       CoreMark (10 iterations) with the CPI stack
 #   make study       trace-driven branch predictor study on CoreMark
 SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: test test-quick mutate bench study sim hello progs clean
+.PHONY: test test-quick test-configs bench-configs mutate bench study sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -47,6 +49,12 @@ study:
 	@sim/obj_base/Vrv_soc +firmware=sw/build/cm1/coremark.hex +trace=out/study.rtl \
 	  >/dev/null 2>out/study.rtl.log
 	@python3 tools/bpred_study.py out/study.rtl
+
+test-configs:
+	@mkdir -p out && tools/test_configs.sh 30
+
+bench-configs:
+	@mkdir -p out && tools/test_configs.sh 30 --bench
 
 mutate: sim
 	@python3 tools/mutate.py --seeds 20

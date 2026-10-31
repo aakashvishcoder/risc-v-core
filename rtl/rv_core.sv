@@ -331,8 +331,11 @@ module rv_core #(
   //   [3:1]   branch predictor: 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
   //   [11:4]  return-address stack depth (0 = none)
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
+  //   [19:16] log2(branch history table entries)
+  //   [23:20] gshare global history length
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
-  wire [31:0] mconfig = {16'b0, 4'(IBTB_BITS), 8'(RAS_DEPTH), 3'(BPRED), EARLY_JAL};
+  wire [31:0] mconfig = {8'b0, 4'(GHR_BITS), 4'(BHT_BITS), 4'(IBTB_BITS), 8'(RAS_DEPTH),
+                         3'(BPRED), EARLY_JAL};
 
   // CSR reads (read-only counters)
   logic [31:0] csr_val;

@@ -3,10 +3,14 @@
 Mutation testing: does the test suite actually catch pipeline bugs?
 
 Each mutant is one realistic hardware bug (a missing forwarding path, a
-missing stall, ...) injected into a *copy* of rtl/. The copy is built into
-its own Verilator model and run against random co-simulation seeds. A mutant
-is "killed" if at least one seed fails. A surviving mutant means a hole in
-the tests (or an equivalent mutant that doesn't change behavior).
+missing stall, a predictor that never trains, ...) injected into a *copy* of
+rtl/. The copy is built into its own Verilator model (default configuration)
+and checked two ways:
+  - random co-simulation seeds catch functional bugs (wrong results)
+  - perftest catches performance bugs: the design still computes the right
+    answers, so co-simulation can't see them, but event counts are off
+A mutant is "killed" if either check fails. A surviving mutant means a hole
+in the tests (or an equivalent mutant that doesn't change behavior).
 
 The real rtl/ directory is never modified.
 
@@ -51,8 +55,8 @@ MUTANTS = [
      "if (redirect_ex || stall_d || !valid_d) begin",
      "if (stall_d || !valid_d) begin"),
     ("JALR keeps bit 0", "rv_core.sv",
-     "((a_fwd + ex.imm) & ~32'd1)",
-     "(a_fwd + ex.imm)"),
+     "wire [31:0] jalr_actual = (a_fwd + ex.imm) & ~32'd1;",
+     "wire [31:0] jalr_actual = (a_fwd + ex.imm);"),
     ("BLTU compares signed", "rv_core.sv",
      "3'b110:  br_cond = (a_fwd <  b_fwd);",
      "3'b110:  br_cond = ($signed(a_fwd) <  $signed(b_fwd));"),
@@ -68,6 +72,44 @@ MUTANTS = [
     ("register file not write-through", "rv_regfile.sv",
      "(we && wa == ra1) ? wd : regs[ra1]",
      "regs[ra1]"),
+    # --- branch prediction: functional ---
+    ("wrongly-taken branch resumes at target, not pc+4", "rv_core.sv",
+     "    else if (ex.c.is_branch && !br_cond)  target_ex = ex.pc + 32'd4;  // predicted taken, wasn't\n",
+     ""),
+    ("prediction not passed to EX", "rv_core.sv",
+     "ex.pred_taken <= pred_taken_d;",
+     "ex.pred_taken <= 1'b0;"),
+    ("EX trusts predicted JALR target", "rv_core.sv",
+     "(ex.c.is_jalr && !(ex.jalr_pred && ex.jalr_target == jalr_actual))",
+     "(ex.c.is_jalr && !ex.jalr_pred)"),
+    ("decode redirect ignores a stall", "rv_core.sv",
+     """    else if (!valid_d || stall_d) fetch_pc = pc_d;       // re-read same word
+    else if (redirect_id)         fetch_pc = target_id;""",
+     """    else if (redirect_id)         fetch_pc = target_id;
+    else if (!valid_d || stall_d) fetch_pc = pc_d;"""),
+    ("decode redirect outranks EX redirect", "rv_core.sv",
+     """    if (redirect_ex)              fetch_pc = target_ex;  // EX outranks ID: ID may be wrong-path
+    else if (!valid_d || stall_d) fetch_pc = pc_d;       // re-read same word
+    else if (redirect_id)         fetch_pc = target_id;""",
+     """    if (redirect_id && valid_d && !stall_d) fetch_pc = target_id;
+    else if (redirect_ex)         fetch_pc = target_ex;
+    else if (!valid_d || stall_d) fetch_pc = pc_d;"""),
+    ("decode drops JAL", "rv_core.sv",
+     "wire        redirect_id = (EARLY_JAL && c_d.is_jal) ||",
+     "wire        redirect_id = (1'b0 && c_d.is_jal) ||"),
+    # --- branch prediction: performance only ---
+    ("branch history table never trained up", "rv_core.sv",
+     "if (br_cond && bht[ex.bht_idx] != 2'b11)",
+     "if (1'b0 && br_cond && bht[ex.bht_idx] != 2'b11)"),
+    ("gshare history never updated", "rv_core.sv",
+     "ghr <= {ghr[GHR_BITS-2:0], br_cond};",
+     "ghr <= ghr;"),
+    ("return-address stack never pops", "rv_core.sv",
+     "wire ras_pop  = (RAS_DEPTH > 0) && c_d.is_jalr",
+     "wire ras_pop  = 1'b0 && (RAS_DEPTH > 0) && c_d.is_jalr"),
+    ("return-address stack pushes pc, not pc+4", "rv_core.sv",
+     "ras[ras_inc] <= pc_d + 32'd4;",
+     "ras[ras_inc] <= pc_d;"),
 ]
 
 RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_regfile.sv", "rv_core.sv",
@@ -75,7 +117,8 @@ RTL_FILES = ["rv_defs.svh", "rv_alu.sv", "rv_regfile.sv", "rv_core.sv",
 
 
 def run(cmd, **kw):
-    return subprocess.run(cmd, shell=True, capture_output=True, text=True, **kw)
+    return subprocess.run(cmd, shell=True, capture_output=True, text=True,
+                          errors="replace", **kw)
 
 
 def main():
@@ -86,6 +129,9 @@ def main():
     args = ap.parse_args()
 
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
+    if run(f"make -s -C {ROOT}/sw PROG=perftest").returncode != 0:
+        sys.exit("could not build perftest")
+    perftest = f"{ROOT}/sw/build/perftest.hex"
     killed = 0
     mutants = [m for m in MUTANTS if not args.only or args.only in m[0]]
     for name, fname, old, new in mutants:
@@ -112,9 +158,12 @@ def main():
                     env=dict(env, SIM=f"{obj}/Vrv_soc", KEEP_FAILS="0"))
             summary = r.stdout.strip().splitlines()[-1]
             failed = int(summary.split(",")[1].split()[0])
-            status = "KILLED" if failed else "SURVIVED"
-            killed += bool(failed)
-            print(f"  {status:8} {name:46} ({failed}/{args.seeds} seeds fail)")
+            p = run(f"{obj}/Vrv_soc +firmware={perftest} +max_cycles=2000000")
+            perf_fail = p.returncode != 0 or "perftest: 0 failures" not in p.stdout
+            dead = failed > 0 or perf_fail
+            killed += dead
+            print(f"  {'KILLED' if dead else 'SURVIVED':8} {name:50} "
+                  f"random {failed:2}/{args.seeds} fail   perftest {'FAIL' if perf_fail else 'pass'}")
         finally:
             shutil.rmtree(work, ignore_errors=True)
 
