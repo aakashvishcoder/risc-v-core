@@ -1,10 +1,10 @@
 # Kernels with exactly known performance-event counts.
 #
-# Each kernel is   void kN(uint32_t delta[6])
-# It snapshots cycle + hpmcounter3..7, runs a loop, snapshots again, and writes
-# the six differences to delta[]:
-#   [0] cycles  [1] load-use stalls  [2] flush cycles
-#   [3] branches  [4] taken branches  [5] jumps
+# Each kernel is   void kN(uint32_t delta[8])
+# It snapshots cycle + hpmcounter3..9, runs a loop, snapshots again, and writes
+# the eight differences to delta[]:
+#   [0] cycles  [1] load-use stalls  [2] flush cycles  [3] branches
+#   [4] taken branches  [5] jumps  [6] branch mispredicts  [7] jump redirects
 #
 # Snapshots read the counters in the same order at the start and the end, so
 # each counter is sampled the same distance from its own reads and the
@@ -12,45 +12,45 @@
 
 #define N 100
 
-.macro SNAP base
+.macro SNAP
     csrr s2, cycle
     csrr s3, hpmcounter3
     csrr s4, hpmcounter4
     csrr s5, hpmcounter5
     csrr s6, hpmcounter6
     csrr s7, hpmcounter7
+    csrr s8, hpmcounter8
+    csrr s9, hpmcounter9
+.endm
+
+.macro DIFF1 csr, saved, off
+    csrr t0, \csr
+    sub  t0, t0, \saved
+    sw   t0, \off(a0)
 .endm
 
 .macro DIFF
-    csrr t0, cycle
-    sub  t0, t0, s2
-    sw   t0, 0(a0)
-    csrr t0, hpmcounter3
-    sub  t0, t0, s3
-    sw   t0, 4(a0)
-    csrr t0, hpmcounter4
-    sub  t0, t0, s4
-    sw   t0, 8(a0)
-    csrr t0, hpmcounter5
-    sub  t0, t0, s5
-    sw   t0, 12(a0)
-    csrr t0, hpmcounter6
-    sub  t0, t0, s6
-    sw   t0, 16(a0)
-    csrr t0, hpmcounter7
-    sub  t0, t0, s7
-    sw   t0, 20(a0)
+    DIFF1 cycle,       s2, 0
+    DIFF1 hpmcounter3, s3, 4
+    DIFF1 hpmcounter4, s4, 8
+    DIFF1 hpmcounter5, s5, 12
+    DIFF1 hpmcounter6, s6, 16
+    DIFF1 hpmcounter7, s7, 20
+    DIFF1 hpmcounter8, s8, 24
+    DIFF1 hpmcounter9, s9, 28
 .endm
 
 .macro PROLOGUE
-    addi sp, sp, -32
+    addi sp, sp, -48
     sw   s2, 0(sp)
     sw   s3, 4(sp)
     sw   s4, 8(sp)
     sw   s5, 12(sp)
     sw   s6, 16(sp)
     sw   s7, 20(sp)
-    sw   ra, 24(sp)
+    sw   s8, 24(sp)
+    sw   s9, 28(sp)
+    sw   ra, 32(sp)
 .endm
 
 .macro EPILOGUE
@@ -60,15 +60,16 @@
     lw   s5, 12(sp)
     lw   s6, 16(sp)
     lw   s7, 20(sp)
-    lw   ra, 24(sp)
-    addi sp, sp, 32
+    lw   s8, 24(sp)
+    lw   s9, 28(sp)
+    lw   ra, 32(sp)
+    addi sp, sp, 48
     ret
 .endm
 
     .text
 
-# k1: load immediately consumed + counted loop.
-# Expect: load-use N, branches N, taken N-1, flush N-1, jumps 0.
+# k1: load immediately consumed + counted loop (400 instructions).
     .globl k1
 k1:
     PROLOGUE
@@ -82,8 +83,7 @@ k1:
     DIFF
     EPILOGUE
 
-# k2: same loop with one independent instruction between load and use.
-# Expect: load-use 0 (forwarding from WB covers it), branches N, taken N-1.
+# k2: one independent instruction between load and use (400 instructions).
     .globl k2
 k2:
     PROLOGUE
@@ -97,9 +97,7 @@ k2:
     DIFF
     EPILOGUE
 
-# k3: load feeding the *second* source operand, and a load feeding a store's
-# data (a store reads rs2 in EX too, so this must stall as well).
-# Expect: load-use 2N, branches N, taken N-1.
+# k3: load feeding rs2, and a load feeding a store's data (600 instructions).
     .globl k3
 k3:
     PROLOGUE
@@ -115,8 +113,7 @@ k3:
     DIFF
     EPILOGUE
 
-# k4: call / return in a loop.
-# Expect: jumps 2N (jal + jalr), branches N, taken N-1, flush 2N + N-1.
+# k4: call / return in a loop (500 instructions).
     .globl k4
 k4:
     PROLOGUE
@@ -132,8 +129,7 @@ leaf:
     addi t6, t6, 1
     ret
 
-# k5: load into x0 followed by a use of x0 - x0 is never a real dependence.
-# Expect: load-use 0.
+# k5: load into x0 followed by a use of x0 (400 instructions).
     .globl k5
 k5:
     PROLOGUE
@@ -143,6 +139,34 @@ k5:
 1:  lw   x0, 0(t1)
     add  t4, x0, x0
     addi t3, t3, -1
+    bnez t3, 1b
+    DIFF
+    EPILOGUE
+
+# k6: forward branch that is never taken, inside a loop (400 instructions).
+    .globl k6
+k6:
+    PROLOGUE
+    li   t3, N
+    SNAP
+1:  beq  t3, x0, 2f          # t3 != 0 inside the loop: never taken
+    addi t4, t4, 1
+2:  addi t3, t3, -1
+    bnez t3, 1b
+    DIFF
+    EPILOGUE
+
+# k7: forward branch that alternates taken / not taken (450 instructions).
+# Taken when t3 is even (50 of 100 iterations), skipping one instruction.
+    .globl k7
+k7:
+    PROLOGUE
+    li   t3, N
+    SNAP
+1:  andi t0, t3, 1
+    beqz t0, 2f
+    addi t4, t4, 1
+2:  addi t3, t3, -1
     bnez t3, 1b
     DIFF
     EPILOGUE

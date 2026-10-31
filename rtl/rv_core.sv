@@ -78,6 +78,7 @@ module rv_core #(
     logic [31:0] rs1_val;
     logic [31:0] rs2_val;
     logic [31:0] imm;
+    logic        pred_taken;   // decode predicted taken and already redirected
     ctrl_t       c;
   } idex_t;
 
@@ -248,51 +249,75 @@ module rv_core #(
     endcase
   end
 
-  wire redirect_ex = ex.valid && (ex.c.is_jal || ex.c.is_jalr || (ex.c.is_branch && br_cond));
-  wire [31:0] target_ex = ex.c.is_jalr ? ((a_fwd + ex.imm) & ~32'd1) : (ex.pc + ex.imm);
+  // Control-flow resolution. A conditional branch redirects when its outcome
+  // differs from the decode-stage prediction (pred_taken); jumps whose target
+  // wasn't already followed in decode redirect too.
+  wire br_mispredict = ex.valid && ex.c.is_branch && (br_cond != ex.pred_taken);
+  wire jmp_redirect  = ex.valid && (ex.c.is_jal || ex.c.is_jalr);
+  wire redirect_ex   = br_mispredict || jmp_redirect;
+
+  logic [31:0] target_ex;
+  always_comb begin
+    if (ex.c.is_jalr)                     target_ex = (a_fwd + ex.imm) & ~32'd1;
+    else if (ex.c.is_branch && !br_cond)  target_ex = ex.pc + 32'd4;  // predicted taken, wasn't
+    else                                  target_ex = ex.pc + ex.imm;
+  end
 
   // -------------------------------------------------------------------------
-  // Performance events, counted in hpmcounter3..7 (events are hardwired, so
+  // Performance events, counted in hpmcounter3..9 (events are hardwired, so
   // the mhpmevent selectors are not implemented).
   //   3  load-use stall cycles     ID held because EX has a load it depends on
   //   4  flush cycles              cycles lost to a redirect from EX
   //   5  conditional branches      resolved in EX
   //   6  taken conditional branches
   //   7  jumps                     JAL + JALR
-  // With predict-not-taken every taken branch and every jump redirects, so
-  // event 4 == event 6 + event 7, and
+  //   8  branch mispredictions     (redirects caused by a conditional branch)
+  //   9  jump redirects from EX    (jumps not followed in decode, or followed
+  //                                 to the wrong target)
+  // Every flush is one or the other, so event 4 == event 8 + event 9, and
   //   cycles = instret + load-use stalls + flush cycles + pipeline fill.
   // -------------------------------------------------------------------------
-  logic [4:0]  perf_ev;
-  logic [63:0] hpm [3:7];
+  localparam int NHPM = 7;               // hpmcounter3 .. hpmcounter9
+  logic [NHPM-1:0] perf_ev;
+  logic [63:0]     hpm [NHPM];
 
   assign perf_ev[0] = valid_d && load_use && !redirect_ex && !halt_fetch;
   assign perf_ev[1] = redirect_ex;
   assign perf_ev[2] = ex.valid && ex.c.is_branch;
   assign perf_ev[3] = ex.valid && ex.c.is_branch && br_cond;
   assign perf_ev[4] = ex.valid && (ex.c.is_jal || ex.c.is_jalr);
+  assign perf_ev[5] = br_mispredict;
+  assign perf_ev[6] = jmp_redirect;
+
+  // Read-only configuration register in the custom machine CSR space, so
+  // software (tests, benchmarks) can tell which features this build has.
+  //   [0]     JAL resolved in decode
+  //   [3:1]   branch predictor: 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
+  //   [11:4]  return-address stack depth (0 = none)
+  //   [15:12] log2(indirect jump target buffer entries) (0 = none)
+  // Features are added in later commits; for now every field reads 0.
+  localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
+  wire [31:0] mconfig = 32'b0;
 
   // CSR reads (read-only counters)
   logic [31:0] csr_val;
   always_comb begin
-    unique casez (ex.instr[31:20])
+    unique case (ex.instr[31:20])
       12'hC00, 12'hC01, 12'hB00: csr_val = cycle_ctr[31:0];
       12'hC80, 12'hC81, 12'hB80: csr_val = cycle_ctr[63:32];
       12'hC02, 12'hB02:          csr_val = instret_ctr[31:0];
       12'hC82, 12'hB82:          csr_val = instret_ctr[63:32];
-      12'hC03, 12'hB03:          csr_val = hpm[3][31:0];
-      12'hC04, 12'hB04:          csr_val = hpm[4][31:0];
-      12'hC05, 12'hB05:          csr_val = hpm[5][31:0];
-      12'hC06, 12'hB06:          csr_val = hpm[6][31:0];
-      12'hC07, 12'hB07:          csr_val = hpm[7][31:0];
-      12'hC83, 12'hB83:          csr_val = hpm[3][63:32];
-      12'hC84, 12'hB84:          csr_val = hpm[4][63:32];
-      12'hC85, 12'hB85:          csr_val = hpm[5][63:32];
-      12'hC86, 12'hB86:          csr_val = hpm[6][63:32];
-      12'hC87, 12'hB87:          csr_val = hpm[7][63:32];
       12'h301:                   csr_val = 32'h4000_0100;  // misa: RV32I
+      CSR_MCONFIG:               csr_val = mconfig;
       default:                   csr_val = 32'b0;          // mhartid etc.
     endcase
+    // hpmcounterN / mhpmcounterN (low halves at C0N/B0N, high at C8N/B8N)
+    for (int k = 0; k < NHPM; k++) begin
+      if (ex.instr[31:20] == (12'hC03 + k[11:0]) || ex.instr[31:20] == (12'hB03 + k[11:0]))
+        csr_val = hpm[k][31:0];
+      if (ex.instr[31:20] == (12'hC83 + k[11:0]) || ex.instr[31:20] == (12'hB83 + k[11:0]))
+        csr_val = hpm[k][63:32];
+    end
   end
 
   logic [31:0] ex_result;
@@ -362,12 +387,12 @@ module rv_core #(
       halted      <= 1'b0;
       cycle_ctr   <= '0;
       instret_ctr <= '0;
-      for (int k = 3; k <= 7; k++) hpm[k] <= '0;
+      for (int k = 0; k < NHPM; k++) hpm[k] <= '0;
     end else if (!halted) begin
       cycle_ctr <= cycle_ctr + 64'd1;
       if (wb.valid) instret_ctr <= instret_ctr + 64'd1;
-      for (int k = 3; k <= 7; k++)
-        if (perf_ev[k-3]) hpm[k] <= hpm[k] + 64'd1;
+      for (int k = 0; k < NHPM; k++)
+        if (perf_ev[k]) hpm[k] <= hpm[k] + 64'd1;
 
       // IF -> ID
       pc_d    <= fetch_pc;
@@ -385,8 +410,9 @@ module rv_core #(
         ex.rs2     <= rs2_d;
         ex.rs1_val <= rf_rd1;
         ex.rs2_val <= rf_rd2;
-        ex.imm     <= imm_d;
-        ex.c       <= c_d;
+        ex.imm        <= imm_d;
+        ex.pred_taken <= 1'b0;
+        ex.c          <= c_d;
         if (c_d.trap) halt_fetch <= 1'b1;
       end
 
