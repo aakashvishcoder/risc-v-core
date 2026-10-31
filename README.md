@@ -1,8 +1,8 @@
 # risc-v-core
 
-A 5-stage pipelined RISC-V (RV32I) processor written in SystemVerilog, with
-gshare branch prediction, a return-address stack and an indirect jump target
-buffer, built to run on my
+A 5-stage pipelined RISC-V (RV32IM) processor written in SystemVerilog, with
+gshare branch prediction, a return-address stack, an indirect jump target
+buffer and a hardware multiplier and divider, built to run on my
 [Artix-7 FPGA carrier board](https://github.com/aakashvishcoder/fpgacarrierboard).
 
 ## Status
@@ -13,13 +13,14 @@ Work in progress. The core runs C programs in simulation:
 $ make -C sw PROG=hello && make -C sim run HEX=../sw/build/hello.hex
 Hello from risc-v-core!
 printing that took 232 cycles, 201 instructions
-[tb] stop: exit  code=0  cycles=3755  retired=3575  CPI=1.050  leds=0xa5
+[tb] stop: exit  code=0  cycles=956  retired=788  CPI=1.213  leds=0xa5
 ```
 
-| | Baseline pipeline | With branch prediction |
-|---|---|---|
-| CoreMark/MHz | 0.970 | **1.083** (+11.6%) |
-| CPI | 1.164 | 1.043 |
+| | Baseline pipeline | + branch prediction | + multiply/divide |
+|---|---|---|---|
+| CoreMark/MHz | 0.970 | 1.083 (+11.6%) | **2.372** (2.45× baseline) |
+| CPI | 1.164 | 1.043 | 1.140 |
+| Instructions (10 iterations) | 8.85M | 8.85M | 3.70M |
 
 ## Roadmap
 
@@ -29,7 +30,7 @@ printing that took 232 cycles, 201 instructions
 - [x] Verification: instruction-set reference model, random co-simulation, mutation testing
 - [x] CoreMark port, hardware performance counters, branch predictor study
 - [x] Branch prediction: static, bimodal, gshare, return-address stack, indirect target buffer
-- [ ] M extension (pipelined multiplier, iterative divider)
+- [x] M extension: pipelined multiplier, iterative divider
 - [ ] Instruction and data caches in front of a slow main memory
 - [ ] Machine-mode traps, CSRs, timer interrupts
 - [ ] FPGA bring-up on the carrier board
@@ -61,11 +62,14 @@ make bench-configs                         # ... and benchmark each one
 The predictor is configurable at build time (defaults shown):
 
 ```
-make -C sim OBJ=obj_mine EARLY_JAL=1 BPRED=3 BHT_BITS=8 GHR_BITS=8 RAS_DEPTH=8 IBTB_BITS=4
+make -C sim OBJ=obj_mine EARLY_JAL=1 BPRED=3 BHT_BITS=8 GHR_BITS=8 RAS_DEPTH=8 IBTB_BITS=4 M_EXT=2
 ```
 
 `BPRED` selects 0 = predict not-taken, 1 = static BTFN, 2 = bimodal, 3 = gshare.
-Software can read the configuration from the `mconfig` CSR (0xFC0).
+`M_EXT` selects 0 = no M extension, 1 = multiply only (Zmmul), 2 = full M.
+Software can read the configuration from the `mconfig` CSR (0xFC0). Programs
+build for `rv32im` by default; pass `MARCH=rv32i_zicsr` (or
+`rv32i_zmmul_zicsr`) to `make -C sw` for a core without M.
 
 Testbench options: `+trace=<file>` writes one line per retired instruction,
 `+vcd=<file>` dumps waveforms, `+max_cycles=<n>` sets a timeout.
@@ -78,9 +82,10 @@ Testbench options: `+trace=<file>` writes one line per retired instruction,
 == reference model known-answer tests
 16/16 reference-model tests passed
 == directed programs (RTL vs reference model)
-hello            MATCH: 3575 instructions | uart ok | exit  code=0  cycles=3755 ...
-perftest         MATCH: 56262 instructions | uart ok | exit  code=0  cycles=58858 ...
-coremark_1iter   MATCH: 999459 instructions | uart ok | exit  code=0  cycles=1042025 ...
+hello            MATCH: 788 instructions | uart ok | exit  code=0  cycles=956 ...
+perftest         MATCH: 21589 instructions | uart ok | exit  code=0  cycles=28800 ...
+mext             MATCH: 1037 instructions | uart ok | exit  code=0  cycles=3038 ...
+coremark_1iter   MATCH: 408859 instructions | uart ok | exit  code=0  cycles=469314 ...
 == random programs
 random tests: 100 passed, 0 failed
 ```
@@ -105,62 +110,80 @@ flow is built to make every predictor mispredict and recover: counted loops,
 a 12-deep call chain (deeper than the return-address stack), "returns" to
 addresses that were never called, and indirect jumps whose target alternates.
 
-**Every configuration.** `make test-configs` builds nine predictor
-configurations side by side and runs the counter test, a co-simulated
-CoreMark iteration and random programs on each, including a stress build with
-4-entry tables, a 2-entry return-address stack and a 2-entry target buffer,
-where aliasing and overflow happen constantly.
+**Multiply/divide corner cases.** `sw/mext` checks 30 results the spec
+defines exactly: MULH/MULHSU/MULHU on extreme operands, divide by zero,
+`INT_MIN / -1`, and every sign combination of DIV and REM. Random programs
+also mix in M instructions. Some bugs need both: a REM that takes the
+divisor's sign fails only 5 of 20 random seeds, but the directed test every
+time.
+
+**Every configuration.** `make test-configs` builds eleven configurations side
+by side, from the baseline pipeline up to full prediction with RV32IM, and
+runs the counter test, the M test (where the core has M), a co-simulated
+CoreMark iteration and random programs on each. Programs are compiled for
+each configuration's instruction set. One build has 4-entry tables, a 2-entry
+return-address stack and a 2-entry target buffer, so aliasing and overflow
+happen constantly.
 
 **Mutation testing.** Passing tests only matter if they would fail on a broken
 design. `tools/mutate.py` (`make mutate`) injects realistic bugs, one at a
 time, into a copy of the RTL and checks that the tests catch each. Random
-co-simulation catches wrong results; the counter test (`perftest`) catches
-bugs that keep results correct but cost cycles:
+co-simulation (RV32IM) catches wrong results, `sw/mext` checks multiply/divide
+results directly, and the counter test (`perftest`) catches bugs that keep
+results correct but cost cycles:
 
-| Injected bug | Random seeds failing (of 20) | perftest |
-|---|---|---|
-| No MEM→EX forwarding | 20 | fail |
-| No WB→EX forwarding | 20 | fail |
-| Forwarding priority reversed (WB before MEM) | 20 | fail |
-| Forwarding a result destined for x0 | 19 | fail |
-| No load-use stall | 20 | fail |
-| Load-use check ignores rs2 | 20 | fail |
-| No flush after a taken branch | 20 | fail |
-| JALR doesn't clear bit 0 | 20 | pass |
-| BLTU compares signed | 13 | pass |
-| LB zero-extends | 18 | pass |
-| SB writes the wrong byte lane | 20 | pass |
-| SRA behaves like SRL | 17 | pass |
-| Register file not write-through | 20 | fail |
-| Wrongly-taken branch resumes at its target, not pc+4 | 20 | fail |
-| Prediction not passed to EX | 20 | fail |
-| EX trusts a predicted JALR target without checking | 20 | fail |
-| Decode redirect ignores a stall | 19 | fail |
-| Decode redirect outranks an EX redirect | 20 | fail |
-| Decode drops JAL | 20 | fail |
-| Branch history table never trained | **0** | fail |
-| gshare history never updated | **0** | fail |
-| Return-address stack never pops | **0** | fail |
-| Return-address stack pushes pc instead of pc+4 | **0** | fail |
+| Injected bug | Random seeds failing (of 20) | perftest | mext |
+|---|---|---|---|
+| No MEM→EX forwarding | 20 | fail | fail |
+| No WB→EX forwarding | 20 | fail | fail |
+| Forwarding priority reversed (WB before MEM) | 20 | fail | fail |
+| Forwarding a result destined for x0 | 20 | fail | pass |
+| No load-use stall | 20 | fail | fail |
+| Load-use check ignores rs2 | 20 | fail | fail |
+| No flush after a taken branch | 20 | fail | fail |
+| JALR doesn't clear bit 0 | 19 | pass | pass |
+| BLTU compares signed | 14 | pass | pass |
+| LB zero-extends | 20 | pass | pass |
+| SB writes the wrong byte lane | 20 | pass | pass |
+| SRA behaves like SRL | 17 | pass | pass |
+| Register file not write-through | 20 | fail | fail |
+| Wrongly-taken branch resumes at its target, not pc+4 | 20 | fail | fail |
+| Prediction not passed to EX | 20 | fail | fail |
+| EX trusts a predicted JALR target without checking | 20 | fail | fail |
+| Decode redirect ignores a stall | 20 | fail | pass |
+| Decode redirect outranks an EX redirect | 20 | fail | pass |
+| Decode drops JAL | 20 | fail | fail |
+| No multiply-use stall | 6 | fail | fail |
+| MULHSU treats rs2 as signed | 8 | pass | fail |
+| MULH* return the low word | 20 | fail | fail |
+| Divide doesn't hold EX | 20 | fail | fail |
+| No MEM bubbles while dividing | 20 | pass | pass |
+| Divide by zero returns 0 | 17 | pass | fail |
+| REM takes the divisor's sign | 5 | pass | fail |
+| Branch history table never trained | **0** | fail | pass |
+| gshare history never updated | **0** | fail | pass |
+| Return-address stack never pops | **0** | fail | pass |
+| Return-address stack pushes pc instead of pc+4 | **0** | fail | pass |
+| Divide by zero runs all 32 iterations | **0** | fail | pass |
 
-23/23 killed. The last four are performance bugs: the core still computes the
-right answers, so no amount of co-simulation can find them.
+31/31 killed. The five marked **0** are performance bugs: the core still
+computes the right answers, so no amount of co-simulation can find them.
 
 ## Performance
 
 ### CoreMark
 
-`make bench` runs EEMBC CoreMark (2K performance run, clang -O2, RV32I). The
+`make bench` runs EEMBC CoreMark (2K performance run, clang -O2, RV32IM). The
 list, matrix and state CRCs match the reference values (0xe714 / 0x1fd7 /
 0x8e3a), and one full iteration is co-simulated against the reference model
 in `make test`.
 
-| Metric | Base pipeline | With branch prediction |
-|---|---|---|
-| CoreMark/MHz | 0.970 | 1.083 |
-| CPI | 1.164 | 1.043 |
+| Metric | Base pipeline (RV32I) | + branch prediction | + multiply/divide (RV32IM) |
+|---|---|---|---|
+| CoreMark/MHz | 0.970 | 1.083 | 2.372 |
+| CPI | 1.164 | 1.043 | 1.140 |
 
-(The base-pipeline numbers are with linker relaxation enabled; see below.)
+(All with linker relaxation enabled; see below.)
 
 CoreMark requires a 10-second run for an official score (500M cycles at
 50 MHz), which isn't practical in simulation, so these are CoreMark/MHz
@@ -168,10 +191,11 @@ measurements rather than certified results.
 
 ### Where the cycles go
 
-The core has seven hardware performance counters (`hpmcounter3`-`9`, read
+The core has nine hardware performance counters (`hpmcounter3`-`11`, read
 with `csrr`): load-use stall cycles, flush cycles, branches, taken branches,
-jumps, branch mispredictions, and jump redirects. CoreMark reads them around
-its timed region and prints a CPI stack. On the base pipeline:
+jumps, branch mispredictions, jump redirects, multiply-use stall cycles and
+divider stall cycles. CoreMark reads them around its timed region and prints
+a CPI stack. On the base pipeline:
 
 ```
 CPI stack (share of cycles):
@@ -193,19 +217,38 @@ such as stalling on a load into `x0`.
 are flushes, because the core predicts not-taken and 64% of CoreMark's branches
 are taken. Load-use stalls are a distant second.
 
-With branch prediction, flushes drop to 1.1% of cycles and load-use stalls
-(2.9%) become the largest loss:
+With branch prediction (still RV32I), flushes drop to 1.1% of cycles and
+load-use stalls (2.9%) become the largest loss:
 
 ```
 CPI stack (share of cycles):
-  retiring              8848885 (95.8%)
+  retiring              8848891 (95.8%)
   load-use stalls       272264 (2.9%)
-  branch/jump flushes   110492 (1.1%)
+  multiply-use stalls   0 (0.0%)
+  divider stalls        0 (0.0%)
+  branch/jump flushes   110709 (1.1%)
   other                 0 (0.0%)
 Control flow:
   taken branches        895742 (64.3%)
-  mispredicted branches 83292 (5.9%)
+  mispredicted branches 83509 (6.0%)
   redirected jumps      27200 (9.3%)
+```
+
+With multiply and divide in hardware, the instruction count drops by 58% and
+every remaining stall weighs more. Load-use stalls are now 7.9% of cycles, the
+clear next target:
+
+```
+CPI stack (share of cycles):
+  retiring              3697411 (87.7%)
+  load-use stalls       336344 (7.9%)
+  multiply-use stalls   94680 (2.2%)
+  divider stalls        0 (0.0%)
+  branch/jump flushes   86632 (2.0%)
+  other                 0 (0.0%)
+Control flow:
+  taken branches        313222 (50.5%)
+  mispredicted branches 59432 (9.5%)
 ```
 
 ### Branch prediction: study first, then hardware
@@ -213,21 +256,25 @@ Control flow:
 Before building anything, `make study` replays CoreMark's branch and jump
 outcomes through software models of each scheme, using this pipeline's
 penalties, and estimates CPI. Then each scheme was built in RTL and measured
-on the same run (one CoreMark iteration). The estimates matched the hardware
-to within 0.001 CPI on every row:
+on the same run (one CoreMark iteration, RV32I build, before the M extension).
+The estimates matched the hardware to within 0.002 CPI on every row:
 
-| Configuration | Mispredicted branches | Study CPI | Hardware CPI |
+| Configuration | Mispredicted branches (study) | Study CPI | Hardware CPI |
 |---|---|---|---|
 | Baseline: predict not-taken, jumps resolve in EX | 64.6% | 1.160 | 1.160 |
-| + JAL resolved in decode | 64.6% | 1.145 | 1.145 |
-| + static BTFN (backward taken, forward not) | 15.0% | 1.069 | 1.069 |
+| + JAL resolved in decode | 64.6% | 1.144 | 1.144 |
+| + static BTFN (backward taken, forward not) | 15.1% | 1.069 | 1.069 |
 | bimodal, 256 × 2-bit counters | 10.0% | 1.061 | 1.061 |
-| gshare, 256 entries, 8-bit global history | 6.4% | 1.056 | 1.056 |
-| + return-address stack (8 entries) | 6.4% | 1.044 | 1.044 |
-| + indirect jump target buffer (16 entries) | 6.4% | 1.042 | 1.043 |
+| gshare, 256 entries, 8-bit global history | 7.3% | 1.057 | 1.056 |
+| + return-address stack (8 entries) | 7.3% | 1.046 | 1.044 |
+| + indirect jump target buffer (16 entries) | 7.3% | 1.044 | 1.042 |
 | Perfect prediction (upper bound) | 0% | 1.030 | |
 
-CoreMark (10 iterations) across configurations, from `make bench-configs`:
+The static and bimodal rows match exactly. In the gshare rows the hardware
+does slightly better than the model; the two differ in when the global
+history sees each outcome, which changes which branches share counters.
+
+CoreMark (10 iterations, RV32I) across configurations, from `make bench-configs`:
 
 | Configuration | CoreMark/MHz | CPI | Branches mispredicted | Jumps redirected |
 |---|---|---|---|---|
@@ -235,18 +282,18 @@ CoreMark (10 iterations) across configurations, from `make bench-configs`:
 | Early JAL | 0.983 | 1.149 | 64.3% | 53.6% |
 | BTFN | 1.055 | 1.070 | 14.1% | 53.6% |
 | Bimodal | 1.061 | 1.064 | 10.1% | 53.6% |
-| gshare | 1.068 | 1.057 | 5.9% | 53.6% |
-| gshare + RAS | 1.081 | 1.045 | 5.9% | 15.7% |
-| gshare + target buffer | 1.075 | 1.050 | 5.9% | 31.1% |
-| **gshare + RAS + target buffer** | **1.083** | **1.043** | **5.9%** | **9.3%** |
+| gshare | 1.068 | 1.057 | 6.0% | 53.6% |
+| gshare + RAS | 1.081 | 1.045 | 6.0% | 15.7% |
+| gshare + target buffer | 1.075 | 1.050 | 6.0% | 31.1% |
+| **gshare + RAS + target buffer** | **1.083** | **1.043** | **6.0%** | **9.3%** |
 
 What the data shows:
 - **Loop structure does most of the work.** Backward branches are taken 85%
   of the time and forward ones 16%, so a free static rule (BTFN) removes
   three quarters of the mispredictions.
 - **Table size barely matters; history does.** Bimodal goes from 10.1% to
-  9.8% mispredicted between 64 and 1024 entries, but adding 8 bits of global
-  history (gshare) brings it to 6.4%. `perftest` shows why with a branch
+  9.7% mispredicted between 64 and 1024 entries, but adding 8 bits of global
+  history (gshare) brings it to 7.3%. `perftest` shows why with a branch
   that alternates taken/not-taken: a 2-bit counter is always one step behind
   and mispredicts every time (101/101), while gshare learns it (8).
 - **The toolchain mattered as much as the hardware.** The study showed half
@@ -260,6 +307,43 @@ What the data shows:
 - **Aliasing is real.** With 4-entry tables, `perftest`'s never-taken branch
   and its loop branch share one counter and thrash it: 196 of 200
   mispredicted.
+
+### Multiply and divide
+
+| Configuration (with full prediction) | CoreMark/MHz | CPI | Instructions | Branches mispredicted |
+|---|---|---|---|---|
+| RV32I (software multiply/divide) | 1.083 | 1.043 | 8.85M | 6.0% |
+| + multiplier (Zmmul) | 2.372 | 1.139 | 3.70M | 9.5% |
+| + divider (full M) | 2.372 | 1.140 | 3.70M | 9.5% |
+
+- **The multiplier more than doubles performance (2.19×).** On RV32I every
+  multiply is a call to a shift-and-add loop; that loop was 58% of every
+  instruction CoreMark executed.
+- **CPI goes up, and that's expected.** The instructions that disappeared
+  were cheap, predictable loop instructions, so the stalls that remain are a
+  bigger share of fewer cycles. Branch misprediction rises from 6.0% to 9.5%
+  for the same reason: the multiply loop's branches were easy to predict, and
+  what's left is CoreMark's real control flow.
+- **The divider doesn't change CoreMark at all**, because its timed region
+  contains no divides (divider stall cycles: 0). It only speeds up code like
+  `printf`. So for this workload a faster divider (radix-4, early
+  termination) would be wasted area, and the simple radix-2 divider stays.
+
+Design:
+- **Multiplier.** Operands are sign- or zero-extended to 33 bits in EX, so a
+  single signed 33×33 multiply covers MUL, MULH, MULHSU and MULHU. The
+  multiply happens in MEM, between the EX/MEM and MEM/WB pipeline registers,
+  which is the shape of a Xilinx DSP48 with input and output registers. Like
+  a load, the product only exists at the end of MEM, so it can't be
+  forwarded from MEM, and an instruction that needs it immediately stalls
+  one cycle (`perftest` checks this exactly).
+- **Divider.** Radix-2 restoring division on magnitudes, one quotient bit
+  per cycle, with signs fixed at the end. A divide holds EX for 33 cycles
+  (1 to start + 32 iterations); everything behind it waits and MEM gets
+  bubbles. Divide by zero returns the spec's defined result in 1 cycle;
+  `INT_MIN / -1` falls out of the magnitude arithmetic with no special case.
+  The quotient leaves EX like an ALU result, so a dependent instruction gets
+  it by forwarding with no extra stall.
 
 ### Branch prediction design
 
@@ -305,3 +389,5 @@ All prediction happens in decode, and all of it is checked in execute.
   the return-address stack and other indirect jumps by the target buffer;
   `jal` is followed in decode. Everything resolves in EX, and a wrong
   prediction flushes the one instruction behind it (1-cycle penalty).
+- **Multiply** results are produced in MEM (like loads); a **divide** holds
+  EX for 33 cycles.

@@ -41,12 +41,13 @@ bench: sim
 	@sim/obj_dir/Vrv_soc +firmware=sw/build/coremark.hex 2>&1 | \
 	  sed -n '/^\[0\]crc/p; /^risc-v-core:/,$$p'
 
-# The study replays a trace from the baseline configuration (no prediction)
+# The study replays a trace from the baseline configuration (no prediction,
+# RV32I, as in the README's study table)
 study:
-	@$(MAKE) -s -C sim OBJ=obj_base EARLY_JAL=0 BPRED=0 RAS_DEPTH=0 IBTB_BITS=0
-	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=1 BUILD=build/cm1
+	@$(MAKE) -s -C sim OBJ=obj_base EARLY_JAL=0 BPRED=0 RAS_DEPTH=0 IBTB_BITS=0 M_EXT=0
+	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=1 MARCH=rv32i_zicsr BUILD=build/study
 	@mkdir -p out
-	@sim/obj_base/Vrv_soc +firmware=sw/build/cm1/coremark.hex +trace=out/study.rtl \
+	@sim/obj_base/Vrv_soc +firmware=sw/build/study/coremark.hex +trace=out/study.rtl \
 	  >/dev/null 2>out/study.rtl.log
 	@python3 tools/bpred_study.py out/study.rtl
 
