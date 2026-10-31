@@ -251,14 +251,45 @@ module rv_core #(
   wire redirect_ex = ex.valid && (ex.c.is_jal || ex.c.is_jalr || (ex.c.is_branch && br_cond));
   wire [31:0] target_ex = ex.c.is_jalr ? ((a_fwd + ex.imm) & ~32'd1) : (ex.pc + ex.imm);
 
+  // -------------------------------------------------------------------------
+  // Performance events, counted in hpmcounter3..7 (events are hardwired, so
+  // the mhpmevent selectors are not implemented).
+  //   3  load-use stall cycles     ID held because EX has a load it depends on
+  //   4  flush cycles              cycles lost to a redirect from EX
+  //   5  conditional branches      resolved in EX
+  //   6  taken conditional branches
+  //   7  jumps                     JAL + JALR
+  // With predict-not-taken every taken branch and every jump redirects, so
+  // event 4 == event 6 + event 7, and
+  //   cycles = instret + load-use stalls + flush cycles + pipeline fill.
+  // -------------------------------------------------------------------------
+  logic [4:0]  perf_ev;
+  logic [63:0] hpm [3:7];
+
+  assign perf_ev[0] = valid_d && load_use && !redirect_ex && !halt_fetch;
+  assign perf_ev[1] = redirect_ex;
+  assign perf_ev[2] = ex.valid && ex.c.is_branch;
+  assign perf_ev[3] = ex.valid && ex.c.is_branch && br_cond;
+  assign perf_ev[4] = ex.valid && (ex.c.is_jal || ex.c.is_jalr);
+
   // CSR reads (read-only counters)
   logic [31:0] csr_val;
   always_comb begin
-    unique case (ex.instr[31:20])
+    unique casez (ex.instr[31:20])
       12'hC00, 12'hC01, 12'hB00: csr_val = cycle_ctr[31:0];
       12'hC80, 12'hC81, 12'hB80: csr_val = cycle_ctr[63:32];
       12'hC02, 12'hB02:          csr_val = instret_ctr[31:0];
       12'hC82, 12'hB82:          csr_val = instret_ctr[63:32];
+      12'hC03, 12'hB03:          csr_val = hpm[3][31:0];
+      12'hC04, 12'hB04:          csr_val = hpm[4][31:0];
+      12'hC05, 12'hB05:          csr_val = hpm[5][31:0];
+      12'hC06, 12'hB06:          csr_val = hpm[6][31:0];
+      12'hC07, 12'hB07:          csr_val = hpm[7][31:0];
+      12'hC83, 12'hB83:          csr_val = hpm[3][63:32];
+      12'hC84, 12'hB84:          csr_val = hpm[4][63:32];
+      12'hC85, 12'hB85:          csr_val = hpm[5][63:32];
+      12'hC86, 12'hB86:          csr_val = hpm[6][63:32];
+      12'hC87, 12'hB87:          csr_val = hpm[7][63:32];
       12'h301:                   csr_val = 32'h4000_0100;  // misa: RV32I
       default:                   csr_val = 32'b0;          // mhartid etc.
     endcase
@@ -331,9 +362,12 @@ module rv_core #(
       halted      <= 1'b0;
       cycle_ctr   <= '0;
       instret_ctr <= '0;
+      for (int k = 3; k <= 7; k++) hpm[k] <= '0;
     end else if (!halted) begin
       cycle_ctr <= cycle_ctr + 64'd1;
       if (wb.valid) instret_ctr <= instret_ctr + 64'd1;
+      for (int k = 3; k <= 7; k++)
+        if (perf_ev[k-3]) hpm[k] <= hpm[k] + 64'd1;
 
       // IF -> ID
       pc_d    <= fetch_pc;
