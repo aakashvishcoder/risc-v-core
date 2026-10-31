@@ -30,7 +30,8 @@ module rv_core #(
   parameter int          BPRED     = 3,       // 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
   parameter int          BHT_BITS  = 8,       // log2(branch history table entries)
   parameter int          GHR_BITS  = 8,       // gshare global history length
-  parameter int          RAS_DEPTH = 8        // return-address stack entries (0 = none)
+  parameter int          RAS_DEPTH = 8,       // return-address stack entries (0 = none)
+  parameter int          IBTB_BITS = 4        // log2(indirect jump target buffer entries), 0 = none
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -90,6 +91,7 @@ module rv_core #(
     logic [BHT_BITS-1:0] bht_idx;  // table entry used for the prediction
     logic        jalr_pred;    // decode already followed a predicted JALR target
     logic [31:0] jalr_target;  // ... and this is the target it followed
+    logic        ras_popped;   // the prediction came from the return-address stack
     ctrl_t       c;
   } idex_t;
 
@@ -276,6 +278,16 @@ module rv_core #(
     else                                  target_ex = ex.pc + ex.imm;
   end
 
+  // Remember the real target of JALRs the return-address stack didn't predict
+  wire [IB_IW-1:0] ib_idx_e = (IBTB_BITS > 0) ? IB_IW'(ex.pc[IBTB_BITS+1:2]) : '0;
+  always_ff @(posedge clk) begin
+    if (IBTB_BITS > 0 && !rst && !halted && ex.valid && ex.c.is_jalr && !ex.ras_popped) begin
+      ib_valid[ib_idx_e]  <= 1'b1;
+      ib_tag[ib_idx_e]    <= ex.pc[31:IBTB_BITS+2];
+      ib_target[ib_idx_e] <= jalr_actual;
+    end
+  end
+
   // Train the branch history table and shift the outcome into the history
   always_ff @(posedge clk) begin
     if (rst) begin
@@ -320,7 +332,7 @@ module rv_core #(
   //   [11:4]  return-address stack depth (0 = none)
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
-  wire [31:0] mconfig = {20'b0, 8'(RAS_DEPTH), 3'(BPRED), EARLY_JAL};
+  wire [31:0] mconfig = {16'b0, 4'(IBTB_BITS), 8'(RAS_DEPTH), 3'(BPRED), EARLY_JAL};
 
   // CSR reads (read-only counters)
   logic [31:0] csr_val;
@@ -440,8 +452,28 @@ module rv_core #(
   wire [RAS_W-1:0] ras_dec = (ras_top == '0) ? RAS_W'(RAS_N - 1) : ras_top - 1'b1;
   wire [RAS_W-1:0] ras_inc = (ras_top == RAS_W'(RAS_N - 1)) ? '0 : ras_top + 1'b1;
 
-  wire        jalr_pred_d   = ras_pop;
-  wire [31:0] jalr_target_d = ras[ras_top];
+  // -------------------------------------------------------------------------
+  // Indirect jump target buffer (decode stage)
+  // For JALRs the return-address stack doesn't cover (switch tables, calls
+  // through function pointers): a direct-mapped table indexed by pc that
+  // remembers each JALR's last target, tagged with the rest of the pc.
+  // Written in EX with the real target.
+  // -------------------------------------------------------------------------
+  localparam int IB_N   = (IBTB_BITS > 0) ? 2**IBTB_BITS : 1;
+  localparam int IB_IW  = (IBTB_BITS > 0) ? IBTB_BITS : 1;
+  localparam int IB_TW  = 30 - IBTB_BITS;
+  logic              ib_valid  [IB_N];
+  logic [IB_TW-1:0]  ib_tag    [IB_N];
+  logic [31:0]       ib_target [IB_N];
+  initial for (int i = 0; i < IB_N; i++) ib_valid[i] = 1'b0;
+
+  wire [IB_IW-1:0] ib_idx_d = (IBTB_BITS > 0) ? IB_IW'(pc_d[IBTB_BITS+1:2]) : '0;
+  wire [IB_TW-1:0] ib_tag_d = pc_d[31:IBTB_BITS+2];
+  wire ib_hit_d = (IBTB_BITS > 0) && c_d.is_jalr && !ras_pop &&
+                  ib_valid[ib_idx_d] && (ib_tag[ib_idx_d] == ib_tag_d);
+
+  wire        jalr_pred_d   = ras_pop || ib_hit_d;
+  wire [31:0] jalr_target_d = ras_pop ? ras[ras_top] : ib_target[ib_idx_d];
 
   // Decode-stage redirect: follow a JAL, a branch predicted taken, or a
   // return predicted by the return-address stack
@@ -530,6 +562,7 @@ module rv_core #(
         ex.bht_idx    <= bht_idx_d;
         ex.jalr_pred   <= jalr_pred_d;
         ex.jalr_target <= jalr_target_d;
+        ex.ras_popped  <= ras_pop;
         ex.c          <= c_d;
         if (c_d.trap) halt_fetch <= 1'b1;
       end

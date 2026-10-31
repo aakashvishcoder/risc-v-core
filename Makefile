@@ -41,7 +41,7 @@ bench: sim
 
 # The study replays a trace from the baseline configuration (no prediction)
 study:
-	@$(MAKE) -s -C sim OBJ=obj_base EARLY_JAL=0 BPRED=0 RAS_DEPTH=0
+	@$(MAKE) -s -C sim OBJ=obj_base EARLY_JAL=0 BPRED=0 RAS_DEPTH=0 IBTB_BITS=0
 	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=1 BUILD=build/cm1
 	@mkdir -p out
 	@sim/obj_base/Vrv_soc +firmware=sw/build/cm1/coremark.hex +trace=out/study.rtl \

@@ -16,7 +16,8 @@ module rv_soc #(
   parameter int    BPRED        = 3,
   parameter int    BHT_BITS     = 8,
   parameter int    GHR_BITS     = 8,
-  parameter int    RAS_DEPTH    = 8
+  parameter int    RAS_DEPTH    = 8,
+  parameter int    IBTB_BITS    = 4
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -43,7 +44,7 @@ module rv_soc #(
   logic [3:0]  dmem_we;
   logic        dmem_re;
 
-  rv_core #(.EARLY_JAL(EARLY_JAL != 0), .BPRED(BPRED), .BHT_BITS(BHT_BITS), .GHR_BITS(GHR_BITS), .RAS_DEPTH(RAS_DEPTH)) u_core (
+  rv_core #(.EARLY_JAL(EARLY_JAL != 0), .BPRED(BPRED), .BHT_BITS(BHT_BITS), .GHR_BITS(GHR_BITS), .RAS_DEPTH(RAS_DEPTH), .IBTB_BITS(IBTB_BITS)) u_core (
     .clk, .rst,
     .imem_addr, .imem_rdata,
     .dmem_addr, .dmem_wdata, .dmem_we, .dmem_re, .dmem_rdata,
