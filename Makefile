@@ -12,7 +12,7 @@ SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: sim-cache test test-quick test-configs bench-configs mutate bench study cache-study sim hello progs clean
+.PHONY: sim-cache test test-quick test-configs bench-configs mutate demo bench study cache-study sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -20,7 +20,7 @@ sim:
 hello:
 	$(MAKE) -s -C sw PROG=hello
 
-PROGS = hello perftest mext cachetest coldload memstream traptest irqtest
+PROGS = hello perftest mext cachetest coldload memstream traptest irqtest sched
 CACHE_SIM = sim/obj_cache/Vrv_soc
 progs:
 	@for p in $(PROGS); do $(MAKE) -s -C sw PROG=$$p || exit 1; done
@@ -46,6 +46,11 @@ test: sim sim-cache progs
 
 test-quick:
 	@$(MAKE) -s test SEEDS=20
+
+# Preemptive scheduler demo: three tasks time-sliced by the timer interrupt
+demo: sim
+	@$(MAKE) -s -C sw PROG=sched
+	@sim/obj_dir/Vrv_soc +firmware=sw/build/sched.hex
 
 bench: sim
 	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=10
