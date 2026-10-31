@@ -104,32 +104,42 @@ sets a timeout.
 
 ## Verification
 
-`make test` runs everything below in about a minute and a half: every
+`make test` runs everything below in about two and a half minutes: every
 directed program on single-cycle RAM and on the cached memory system, then
-random programs on both.
+random programs on both, with and without exceptions and interrupts.
 
 ```
 == reference model known-answer tests
-16/16 reference-model tests passed
+29/29 reference-model tests passed
 == directed programs (RTL vs reference model), single-cycle RAM
-hello            MATCH: 788 instructions | uart ok | exit  code=0  cycles=956 ...
-perftest         MATCH: 38427 instructions | uart ok | exit  code=0  cycles=50422 ...
-mext             MATCH: 1037 instructions | uart ok | exit  code=0  cycles=3038 ...
-cachetest        MATCH: 49658 instructions | uart ok | exit  code=0  cycles=49772 ...
-coldload         MATCH: 744 instructions | uart ok | exit  code=0  cycles=906 ...
-memstream        MATCH: 162535 instructions | uart ok | exit  code=0  cycles=168076 ...
-coremark_1iter   MATCH: 411155 instructions | uart ok | exit  code=0  cycles=471753 ...
+hello            MATCH: 791 instructions | uart ok | exit  code=0  cycles=958 ...
+perftest         MATCH: 38902 instructions | uart ok | exit  code=0  cycles=50867 ...
+mext             MATCH: 1040 instructions | uart ok | exit  code=0  cycles=3039 ...
+cachetest        MATCH: 49661 instructions | uart ok | exit  code=0  cycles=49775 ...
+coldload         MATCH: 747 instructions | uart ok | exit  code=0  cycles=909 ...
+memstream        MATCH: 162538 instructions | uart ok | exit  code=0  cycles=168071 ...
+traptest         MATCH: 60193 instructions, 32 traps | uart ok | exit  code=0  cycles=68914 ...
+irqtest          MATCH: 171479 instructions, 1270 traps | uart ok | exit  code=0  cycles=322911 ...
+sched            MATCH: 923696 instructions, 430 traps | uart ok | exit  code=0  cycles=2565064 ...
+coremark_1iter   MATCH: 411140 instructions | uart ok | exit  code=0  cycles=472013 ...
 == directed programs, caches + slow main memory
-hello            MATCH: 788 instructions | uart ok | exit  code=0  cycles=2225 ...
-perftest         MATCH: 38517 instructions | uart ok | exit  code=0  cycles=89644 ...
-mext             MATCH: 1037 instructions | uart ok | exit  code=0  cycles=5649 ...
-cachetest        MATCH: 93513 instructions | uart ok | exit  code=0  cycles=316115 ...
-coldload         MATCH: 744 instructions | uart ok | exit  code=0  cycles=2605 ...
-memstream        MATCH: 162805 instructions | uart ok | exit  code=0  cycles=561728 ...
-coremark_1iter   MATCH: 413727 instructions | uart ok | exit  code=0  cycles=547073 ...
+hello            MATCH: 791 instructions | uart ok | exit  code=0  cycles=2251 ...
+perftest         MATCH: 38974 instructions | uart ok | exit  code=0  cycles=91131 ...
+mext             MATCH: 1040 instructions | uart ok | exit  code=0  cycles=5674 ...
+cachetest        MATCH: 93516 instructions | uart ok | exit  code=0  cycles=316553 ...
+coldload         MATCH: 747 instructions | uart ok | exit  code=0  cycles=2632 ...
+memstream        MATCH: 162808 instructions | uart ok | exit  code=0  cycles=561788 ...
+traptest         MATCH: 60193 instructions, 32 traps | uart ok | exit  code=0  cycles=96371 ...
+irqtest          MATCH: 256679 instructions, 2527 traps | uart ok | exit  code=0  cycles=599007 ...
+sched            MATCH: 934735 instructions, 501 traps | uart ok | exit  code=0  cycles=2949759 ...
+coremark_1iter   MATCH: 414017 instructions | uart ok | exit  code=0  cycles=548017 ...
 == random programs, single-cycle RAM
 random tests: 100 passed, 0 failed
 == random programs, caches + slow main memory
+random tests: 50 passed, 0 failed
+== random programs with exceptions and interrupts, single-cycle RAM
+random tests: 100 passed, 0 failed
+== random programs with exceptions and interrupts, caches + slow main memory
 random tests: 50 passed, 0 failed
 ```
 
@@ -140,7 +150,10 @@ misunderstanding of the spec can't hide by being shared between the model and
 the RTL.
 
 **Co-simulation.** The testbench and the model both write a commit trace, one
-line per retired instruction (`pc`, encoding, destination register, value).
+line per retired instruction (`pc`, encoding, destination register, value)
+and one per trap (`mcause`, `mepc`, `mtval`). Values that depend on timing,
+which an instruction-set model doesn't have (counter and `mip` reads, `mtime`,
+and the moment each interrupt arrives), are taken from the RTL trace.
 `tools/cosim.sh` diffs them and reports the first divergence with the
 instructions leading up to it. A run only passes if the program also reaches
 its exit cleanly.
@@ -212,8 +225,10 @@ time, into a copy of the RTL and checks that the tests catch each. Random
 co-simulation (RV32IM) catches wrong results; `sw/mext` checks
 multiply/divide results directly; `sw/cachetest` (with `sw/coldload`) checks
 exact miss counts and data integrity; and the counter test (`perftest`)
-catches bugs that keep results correct but cost cycles. Memory-system mutants
-are built with caches in front of slow memory.
+catches bugs that keep results correct but cost cycles. Random programs that
+trap and get interrupted, together with `sw/traptest`, `sw/irqtest` and the
+scheduler demo, check the trap machinery. Memory-system mutants are built with
+caches in front of slow memory.
 
 | Injected bug | Random seeds failing (of 20) | perftest | mext | cachetest |
 |---|---|---|---|---|
@@ -260,8 +275,41 @@ are built with caches in front of slow memory.
 | D-cache LRU never updated | **0** | pass | pass | fail |
 | Load-use also counted during a cache stall | **0** | fail ² | pass | pass |
 
-42/42 killed. The rows marked **0** keep every result correct, so no amount
-of co-simulation can find them; only the counter and cache tests can.
+Traps and interrupts. "Trap random" is the number of random programs with
+`--traps` that fail, out of 10. "Directed" means `traptest`, `irqtest` or
+the scheduler demo fails:
+
+| Injected bug | Trap random (of 10) | Directed |
+|---|---|---|
+| Faulting store still writes memory | 7 | fail |
+| Trapped instruction still retires | 10 | fail |
+| `mepc` saves the next pc | 10 | fail |
+| Instruction in ID survives a trap | 10 | fail |
+| Trap entry leaves `mstatus.MIE` set | 10 | fail |
+| `mret` leaves interrupts disabled | 8 | fail |
+| Interrupts ignore `mstatus.MIE` | 10 | fail |
+| Interrupt `mtval` holds the pc | 10 | fail |
+| Illegal-instruction `mtval` holds the pc | 9 | fail |
+| Misaligned jump targets not detected | 8 | fail |
+| No access faults for loads/stores | 8 | fail |
+| No fetch access faults | 8 | fail |
+| Writes to read-only CSRs allowed | 1 | fail |
+| Timer outranks external interrupts | **0** | fail |
+| Vectored mode ignored | **0** | fail |
+| `mcountinhibit` doesn't stop `mcycle` | **0** | fail |
+| Timer interrupt only on `mtime == mtimecmp` | **0** | fail |
+
+59/59 killed. The rows marked **0** in the random columns keep every result
+correct, or never come up in random code, so co-simulation alone can't find
+them; only the counter, cache and directed trap tests can.
+
+Mutation testing also catches mutants that are *equivalent*: changes that
+don't change behavior at all. My first attempt at "a faulting instruction
+still writes its register" survived because the register-file write is also
+gated by the slot's valid bit. "A trapped CSR instruction still writes the
+CSR" survived because trap entry already takes priority over a CSR write in
+the same cycle. Both were redundant safety, not test holes, so I replaced
+them with the two bugs above that do change behavior.
 
 Two of these survived the first run, and the fixes are worth noting:
 1. ¹ A cache that ignores the valid bit only false-hits on never-filled
