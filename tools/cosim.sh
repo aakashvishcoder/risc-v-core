@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# Run a program on the RTL and on the reference model, then diff the commit
+# traces and the UART output.
+#   tools/cosim.sh <prog.hex> [extra iss.py args, e.g. --m]
+# Env: SIM=<path to Vrv_soc> to use a different simulator build.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+HEX="$1"; shift || true
+NAME="$(basename "$HEX" .hex)"
+OUT="$ROOT/out"; mkdir -p "$OUT"
+SIM="${SIM:-$ROOT/sim/obj_dir/Vrv_soc}"
+export PYTHONDONTWRITEBYTECODE=1
+
+"$SIM" +firmware="$HEX" +trace="$OUT/$NAME.rtl" > "$OUT/$NAME.rtl.uart" 2> "$OUT/$NAME.rtl.log" || true
+python3 "$ROOT/tools/iss.py" "$HEX" --trace "$OUT/$NAME.ref" --csr-sync "$OUT/$NAME.rtl" "$@" \
+  > "$OUT/$NAME.ref.uart" 2> "$OUT/$NAME.ref.log" || true
+
+printf '%-16s ' "$NAME"
+if ! res=$(python3 "$ROOT/tools/compare.py" "$OUT/$NAME.rtl" "$OUT/$NAME.ref"); then
+  echo "FAILED"; echo "$res"; exit 1
+fi
+printf '%s ' "$res"
+if cmp -s "$OUT/$NAME.rtl.uart" "$OUT/$NAME.ref.uart"; then
+  echo "| uart ok | $(sed 's/\[tb\] stop: //' "$OUT/$NAME.rtl.log")"
+else
+  echo "| UART OUTPUT DIFFERS"; exit 1
+fi
