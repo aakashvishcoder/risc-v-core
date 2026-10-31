@@ -19,9 +19,9 @@ OBJCOPY = llvm-objcopy
 OBJDUMP = llvm-objdump
 
 CFLAGS  = --target=riscv32-unknown-elf -march=$(MARCH) -mabi=ilp32 $(OPT) \
-          -ffreestanding -fno-builtin -nostdlib -mno-relax -Wall \
+          -ffreestanding -fno-builtin -nostdlib -Wall \
           -Icommon -I$(PROG) $(CFLAGS_EXTRA)
-LDFLAGS = -fuse-ld=lld -Wl,-T,common/link.ld -Wl,--no-relax -static
+LDFLAGS = -fuse-ld=lld -Wl,-T,common/link.ld -static
 
 SRCS = common/crt0.S common/rt.c $(wildcard $(PROG)/*.c) $(wildcard $(PROG)/*.S)
 
