@@ -10,9 +10,10 @@ FIRST="${2:-1}"
 MFLAG=""; MARCH="rv32i_zicsr"
 if [[ "${3:-}" == "--m" ]]; then MFLAG="--m"; MARCH="rv32im_zicsr"; fi
 export PYTHONDONTWRITEBYTECODE=1
-# A ~400-instruction random program finishes in ~1500 cycles; anything far
-# beyond that is a hang, so don't let it write a multi-GB trace.
-export MAX_CYCLES="${MAX_CYCLES:-100000}"
+# A random program retires ~12k instructions: well under 100k cycles even with
+# tiny caches and slow memory. Anything far beyond that is a hang, so don't
+# let it write a multi-GB trace.
+export MAX_CYCLES="${MAX_CYCLES:-1000000}"
 KEEP_FAILS="${KEEP_FAILS:-1}"
 
 GEN="$ROOT/sw/gen_rand"; mkdir -p "$GEN" "$ROOT/out"

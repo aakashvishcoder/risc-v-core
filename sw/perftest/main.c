@@ -157,6 +157,11 @@ int main(void) {
     uint32_t exact[NEV] = {0, T->lu, 0, T->br, T->taken, T->jumps, 0, 0, T->mu, T->div, 0, 0};
     for (int k = LU; k < NEV; k++) {
       if (k == FLUSH || k == MISP || k == JREDIR || k == ICS || k == DCS) continue;
+      // A load-use (or multiply-use) stall disappears if the dependent
+      // instruction's fetch missed in the I-cache: it arrives after the
+      // producer has already moved on. Each one hidden needs at least one
+      // I-cache stall cycle.
+      if ((k == LU || k == MU) && d[k] < exact[k] && exact[k] - d[k] <= d[ICS]) continue;
       if (d[k] != exact[k]) {
         printf_("  FAIL %s: %s = %u, expected %u\n", T->name, names[k], d[k], exact[k]);
         ok = 0;

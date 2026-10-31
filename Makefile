@@ -1,5 +1,6 @@
 # Top-level convenience targets.
-#   make test        reference-model tests + directed programs + 100 random seeds (RV32IM)
+#   make test        reference-model tests + directed programs + 100 random seeds (RV32IM),
+#                    on single-cycle RAM and on the cached memory system
 #   make test-quick  same with 20 random seeds
 #   make test-configs  every predictor configuration: perftest, CoreMark, random (~4 min)
 #   make bench-configs same, plus CoreMark/MHz per configuration
@@ -11,7 +12,7 @@ SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: test test-quick test-configs bench-configs mutate bench study cache-study sim hello progs clean
+.PHONY: sim-cache test test-quick test-configs bench-configs mutate bench study cache-study sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -19,20 +20,29 @@ sim:
 hello:
 	$(MAKE) -s -C sw PROG=hello
 
-PROGS = hello perftest mext
+PROGS = hello perftest mext cachetest memstream
+CACHE_SIM = sim/obj_cache/Vrv_soc
 progs:
 	@for p in $(PROGS); do $(MAKE) -s -C sw PROG=$$p || exit 1; done
 
-test: sim progs
+sim-cache:
+	$(MAKE) -s -C sim OBJ=obj_cache CACHES=1
+
+test: sim sim-cache progs
 	@echo "== reference model known-answer tests"
 	@PYTHONDONTWRITEBYTECODE=1 python3 tools/test_iss.py | tail -1
-	@echo "== directed programs (RTL vs reference model)"
-	@for p in $(PROGS); do tools/cosim.sh sw/build/$$p.hex || exit 1; done
 	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=1 BUILD=build/cm1
 	@mkdir -p out && cp sw/build/cm1/coremark.hex out/coremark_1iter.hex
+	@echo "== directed programs (RTL vs reference model), single-cycle RAM"
+	@for p in $(PROGS); do tools/cosim.sh sw/build/$$p.hex || exit 1; done
 	@tools/cosim.sh out/coremark_1iter.hex
-	@echo "== random programs"
+	@echo "== directed programs, caches + slow main memory"
+	@for p in $(PROGS); do SIM=$(CURDIR)/$(CACHE_SIM) tools/cosim.sh sw/build/$$p.hex || exit 1; done
+	@SIM=$(CURDIR)/$(CACHE_SIM) tools/cosim.sh out/coremark_1iter.hex
+	@echo "== random programs, single-cycle RAM"
 	@tools/run_random.sh $(SEEDS) 1 --m
+	@echo "== random programs, caches + slow main memory"
+	@SIM=$(CURDIR)/$(CACHE_SIM) tools/run_random.sh $$(( $(SEEDS) / 2 )) 5000 --m
 
 test-quick:
 	@$(MAKE) -s test SEEDS=20

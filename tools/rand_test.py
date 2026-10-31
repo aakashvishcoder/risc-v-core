@@ -27,8 +27,10 @@ Every program terminates: forward jumps only move forward, and loops count
 down a dedicated register and exit once it is <= 0, so entering a loop body
 from outside (with a stale counter) still runs it a bounded number of times.
 
-All memory traffic goes to a 256-byte scratch buffer, which is checksummed at
-the end so stores are checked too.
+All memory traffic goes to a 2 KB scratch buffer (larger than the default
+data cache, so lines are evicted and dirty lines written back constantly). It
+is filled with pseudo-random words first and checksummed at the end, so every
+store is checked too.
 
     rand_test.py <seed> <out.S> [--n 400] [--m]
 """
@@ -45,6 +47,7 @@ CALLS = "x28"     # counts function bodies executed
 LOOP = "x29"      # loop counter
 TMP = "x30"       # temp for JALR targets and setup
 BASE = "x31"      # scratch-buffer base pointer
+SCRATCH = 2048    # bytes; offsets fit a load/store immediate
 
 CHAIN_DEPTH = 12
 
@@ -84,9 +87,9 @@ def gen(seed, n, m_ext):
             return f"auipc {r()}, {rnd.randint(0, 0xFFFFF)}"
         if k < 0.80:
             op, sz = rnd.choice(LOADS)
-            return f"{op} {rd_any()}, {rnd.randrange(0, 256, sz)}({BASE})"
+            return f"{op} {rd_any()}, {rnd.randrange(0, SCRATCH, sz)}({BASE})"
         op, sz = rnd.choice(STORES)
-        return f"{op} {rs()}, {rnd.randrange(0, 256, sz)}({BASE})"
+        return f"{op} {rs()}, {rnd.randrange(0, SCRATCH, sz)}({BASE})"
 
     def control_op(i):
         k = rnd.random()
@@ -118,13 +121,20 @@ def gen(seed, n, m_ext):
            f"    mv {SAVED_RA}, {RA}",
            f"    la {BASE}, scratch",
            f"    la {CALLSTACK}, callstack",
+           # Fill the scratch buffer with xorshift32 values
+           f"    mv {JT}, {BASE}",
+           f"    li {LOOP}, {SCRATCH // 4}",
+           f"    li {TMP}, {rnd.getrandbits(31) | 1}",
+           f"1:  slli {CALLS}, {TMP}, 13\n    xor {TMP}, {TMP}, {CALLS}",
+           f"    srli {CALLS}, {TMP}, 17\n    xor {TMP}, {TMP}, {CALLS}",
+           f"    slli {CALLS}, {TMP}, 5\n    xor {TMP}, {TMP}, {CALLS}",
+           f"    sw {TMP}, 0({JT})\n    addi {JT}, {JT}, 4",
+           f"    addi {LOOP}, {LOOP}, -1\n    bnez {LOOP}, 1b",
            f"    li {CALLS}, 0",
            f"    li {LOOP}, 0"]
     for reg in POOL:
         v = rnd.choice(INTERESTING) if rnd.random() < 0.4 else rnd.getrandbits(32)
         out.append(f"    li {reg}, {v & 0xFFFFFFFF}")
-    for off in range(0, 256, 4):
-        out.append(f"    li {TMP}, {rnd.getrandbits(32)}\n    sw {TMP}, {off}({BASE})")
 
     loop_id, loop_end = 0, None
     for i in range(n):
@@ -141,8 +151,9 @@ def gen(seed, n, m_ext):
 
     # Fold the scratch buffer and the call count into x10 so every store and
     # every call is observed in the trace
-    for off in range(0, 256, 4):
-        out.append(f"    lw {TMP}, {off}({BASE})\n    add x10, x10, {TMP}")
+    out.append(f"    mv {JT}, {BASE}\n    li {LOOP}, {SCRATCH // 4}")
+    out.append(f"2:  lw {TMP}, 0({JT})\n    add x10, x10, {TMP}\n    addi {JT}, {JT}, 4")
+    out.append(f"    addi {LOOP}, {LOOP}, -1\n    bnez {LOOP}, 2b")
     out.append(f"    add x10, x10, {CALLS}")
     out.append(f"    mv {RA}, {SAVED_RA}\n    li a0, 0\n    ret")
 
@@ -156,7 +167,7 @@ def gen(seed, n, m_ext):
                    f"    ret")
     out.append(f"F{CHAIN_DEPTH}:\n    addi {CALLS}, {CALLS}, 1\n    ret")
 
-    out.append("\n    .bss\n    .balign 4\nscratch: .space 256")
+    out.append(f"\n    .bss\n    .balign 16\nscratch: .space {SCRATCH}")
     out.append(f"callstack: .space {4 * CHAIN_DEPTH}")
     return "\n".join(out) + "\n"
 
