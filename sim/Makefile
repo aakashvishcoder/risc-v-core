@@ -13,7 +13,7 @@ VFLAGS = --cc --exe --build -j 0 -O3 --trace -Wall -Wno-fatal \
          -GCLKS_PER_BIT=0 -CFLAGS -O2 -Mdir $(OBJ)
 
 $(OBJ)/Vrv_soc: $(RTL) tb_soc.cpp
-	verilator $(VFLAGS) $(RTL) tb_soc.cpp 2>&1 | grep -E '%(Error|Warning)' -A3 || true
+	verilator $(VFLAGS) $(RTL) $(CURDIR)/tb_soc.cpp 2>&1 | grep -E '%(Error|Warning)' -A3 || true
 	@test -x $@
 
 run: $(OBJ)/Vrv_soc
