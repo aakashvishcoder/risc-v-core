@@ -57,8 +57,8 @@ MUTANTS = [
      "((c_d.uses_rs1 && rs1_d == ex.rd) || (c_d.uses_rs2 && rs2_d == ex.rd))",
      "(c_d.uses_rs1 && rs1_d == ex.rd)"),
     ("no flush after taken branch", "rv_core.sv",
-     "if (redirect_ex || stall_d || !valid_d) begin",
-     "if (stall_d || !valid_d) begin"),
+     "if (redirect_ex || stall_d || !valid_i) begin",
+     "if (stall_d || !valid_i) begin"),
     ("JALR keeps bit 0", "rv_core.sv",
      "wire [31:0] jalr_actual = (a_fwd + ex.imm) & ~32'd1;",
      "wire [31:0] jalr_actual = (a_fwd + ex.imm);"),
@@ -88,17 +88,17 @@ MUTANTS = [
      "(ex.c.is_jalr && !(ex.jalr_pred && ex.jalr_target == jalr_actual))",
      "(ex.c.is_jalr && !ex.jalr_pred)"),
     ("decode redirect ignores a stall", "rv_core.sv",
-     """    else if (!valid_d || stall_d) fetch_pc = pc_d;       // re-read same word
+     """    else if (!valid_i || stall_d) fetch_pc = pc_d;       // re-read same word
     else if (redirect_id)         fetch_pc = target_id;""",
      """    else if (redirect_id)         fetch_pc = target_id;
-    else if (!valid_d || stall_d) fetch_pc = pc_d;"""),
+    else if (!valid_i || stall_d) fetch_pc = pc_d;"""),
     ("decode redirect outranks EX redirect", "rv_core.sv",
      """    if (redirect_ex)              fetch_pc = target_ex;  // EX outranks ID: ID may be wrong-path
-    else if (!valid_d || stall_d) fetch_pc = pc_d;       // re-read same word
+    else if (!valid_i || stall_d) fetch_pc = pc_d;       // re-read same word
     else if (redirect_id)         fetch_pc = target_id;""",
-     """    if (redirect_id && valid_d && !stall_d) fetch_pc = target_id;
+     """    if (redirect_id && valid_i && !stall_d) fetch_pc = target_id;
     else if (redirect_ex)         fetch_pc = target_ex;
-    else if (!valid_d || stall_d) fetch_pc = pc_d;"""),
+    else if (!valid_i || stall_d) fetch_pc = pc_d;"""),
     ("decode drops JAL", "rv_core.sv",
      "wire        redirect_id = (EARLY_JAL && c_d.is_jal) ||",
      "wire        redirect_id = (1'b0 && c_d.is_jal) ||"),
@@ -126,8 +126,8 @@ MUTANTS = [
      "wire [31:0]        mul_val = (mem.funct3[1:0] == 2'b00) ? product[31:0] : product[63:32];",
      "wire [31:0]        mul_val = product[31:0];"),
     ("divide doesn't hold EX", "rv_core.sv",
-     "wire ex_stall    = div_pending && !(div_issued && div_done);",
-     "wire ex_stall    = 1'b0;"),
+     "wire div_stall   = div_pending && !(div_issued && div_done);",
+     "wire div_stall   = 1'b0;"),
     ("no MEM bubbles while dividing", "rv_core.sv",
      "mem.valid   <= ex.valid && !ex_stall;",
      "mem.valid   <= ex.valid;"),
