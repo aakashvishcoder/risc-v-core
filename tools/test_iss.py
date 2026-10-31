@@ -316,14 +316,43 @@ def interrupts_direct_and_vectored():
         p = li(31, HANDLER | mode) + [csrrw(0, MTVEC, 31), i(0, 0, 0, 0), i(0, 0, 0, 0)]
         p += [0] * (HANDLER // 4 - len(p)) + [i(0, 0, 0, 0)] * 16
         sim = ISS(p)
-        sim.irqs[4] = INTERRUPT | 7                   # machine timer
+        sim.csr[MSTATUS] |= 8                         # MIE
+        sim.csr[MIE] = 1 << 7                         # MTIE
+        sim.irqs[4] = INTERRUPT | 7                   # machine timer, at trace line 4
         lines = []
-        for _ in range(5):
+        for _ in range(6):                            # 4 instrs, the trap, 1 handler instr
             lines += sim.step()
         assert lines[4] == "trap 80000007 pc=00000010 tval=00000000", lines
         assert sim.csr[MEPC] == 16 and sim.csr[MCAUSE] == INTERRUPT | 7
         exp = HANDLER + (4 * 7 if mode else 0) + 4    # handler's first instr executed
         assert sim.pc == exp, (mode, hex(sim.pc))
+
+@test
+def interrupt_while_disabled_is_flagged():
+    # The model takes interrupts where the RTL trace says, but only if they're
+    # enabled: otherwise it emits a line that can never match the RTL's trace
+    for mstatus, mie in ((0, 1 << 7), (8, 1 << 3), (0, 0)):
+        sim = ISS(trap_prog([i(0, 0, 0, 0)] * 4))
+        sim.csr[MSTATUS] |= mstatus
+        sim.csr[MIE] = mie
+        sim.irqs[1] = INTERRUPT | 7
+        lines = sim.step() + sim.step()
+        assert lines[1].startswith("interrupt 80000007 taken while disabled"), lines
+
+@test
+def interrupt_after_exception_keyed_by_trace_line():
+    # An exception at instruction 4 (trace line 3), then an interrupt before the
+    # handler's first instruction (trace line 4): the exception comes first
+    p = trap_prog([ECALL])
+    p += [csrrsi(0, MSTATUS, 8), i(1, 0, 0, 1)] + [0] * 8
+    sim = ISS(p)
+    sim.csr[MIE] = 1 << 3
+    sim.irqs[5] = INTERRUPT | 3              # right after the handler's csrrsi (line 4)
+    lines = []
+    for _ in range(8):
+        lines += sim.step()
+    assert lines[3] == "trap 0000000b pc=0000000c tval=00000000", lines
+    assert lines[5] == f"trap 80000003 pc={HANDLER + 4:08x} tval=00000000", lines
 
 @test
 def wfi_is_a_nop():

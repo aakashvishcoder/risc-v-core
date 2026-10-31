@@ -19,8 +19,10 @@ Co-simulation sync (--sync <rtl trace>): some values depend on pipeline timing,
 which this model doesn't have, so it takes them from the RTL trace:
   - reads of the counter CSRs, mip, and the build-configuration CSRs
   - loads from the CLINT (mtime and friends)
-  - *when* interrupts arrive: the RTL trace says before which instruction each
-    interrupt was taken, and the model takes the same interrupt there
+  - *when* interrupts arrive: the RTL trace says where each interrupt was
+    taken, and the model takes the same interrupt at the same point - after
+    checking that it was enabled there (mstatus.MIE and its mie bit); an
+    interrupt taken while disabled shows up as a mismatching trace line
 Everything else (all other CSRs, every exception) the model computes itself.
 
 Usage: iss.py prog.hex [--trace out.txt] [--max N] [--m] [--sync rtl_trace]
@@ -102,7 +104,8 @@ class ISS:
         self.csr = {MSTATUS: MSTATUS_MPP, MIE: 0, MTVEC: 0, MCOUNTINHIBIT: 0,
                     MSCRATCH: 0, MEPC: 0, MCAUSE: 0, MTVAL: 0}
         self.sync = {}       # retired-instruction index -> value the RTL produced
-        self.irqs = {}       # retired-instruction index -> interrupt cause taken before it
+        self.irqs = {}       # trace line index -> interrupt cause taken there
+        self.lines = 0       # trace lines produced so far (retirements + traps)
         self.mtrace = None   # optional file: one line per RAM load/store
         self.log = []        # trap lines produced by the last step()
 
@@ -188,14 +191,22 @@ class ISS:
         base, mode = self.csr[MTVEC] & ~3, self.csr[MTVEC] & 1
         self.pc = base + 4 * (cause & 0x7FFF_FFFF) if (cause & INTERRUPT and mode == 1) else base
         self.log.append(f"trap {cause & MASK:08x} pc={epc & MASK:08x} tval={tval & MASK:08x}")
+        self.lines += 1
 
     # ---- execution ---------------------------------------------------------
     def step(self):
         """Execute one instruction (taking any pending synced interrupt first).
         Returns the trace lines it produced."""
         self.log = []
-        if self.instret in self.irqs:
-            self.take_trap(self.irqs.pop(self.instret), 0, self.pc)
+        if self.lines in self.irqs:
+            cause = self.irqs.pop(self.lines)
+            code = cause & 0x1F
+            if not (self.csr[MSTATUS] & MSTATUS_MIE and self.csr[MIE] >> code & 1):
+                self.log.append(f"interrupt {cause:08x} taken while disabled: "
+                                f"mstatus={self.csr[MSTATUS]:08x} mie={self.csr[MIE]:08x}")
+                self.lines += 1
+            self.take_trap(cause, 0, self.pc)
+            return self.log
         pc = self.pc
         try:
             if self.region(pc) != "ram":
@@ -206,6 +217,7 @@ class ISS:
             self.take_trap(e.cause, e.tval, pc)
             return self.log
         self.instret += 1
+        self.lines += 1
         if wval is not None and rd != 0:
             self.x[rd] = wval & MASK
             line = f"{pc:08x} {ins:08x} x{rd}={self.x[rd]:08x}"
@@ -372,14 +384,16 @@ def load_sync(sim, path):
     trace: values of CSR reads in timing_csr(), results of CLINT loads, and
     interrupts (trap lines with the interrupt bit set)."""
     retired = 0
+    lineno = 0
     for line in open(path):
         p = line.split()
         if not p:
             continue
+        lineno += 1
         if p[0] == "trap":
             cause = int(p[1], 16)
             if cause & INTERRUPT:
-                sim.irqs[retired] = cause
+                sim.irqs[lineno - 1] = cause
             continue
         if len(p) == 3:
             ins = int(p[1], 16)

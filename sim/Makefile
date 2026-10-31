@@ -6,7 +6,7 @@
 RTL_DIR = ../rtl
 RTL = $(RTL_DIR)/rv_alu.sv $(RTL_DIR)/rv_divider.sv $(RTL_DIR)/rv_regfile.sv $(RTL_DIR)/rv_core.sv \
       $(RTL_DIR)/rv_ram.sv $(RTL_DIR)/rv_mainmem.sv $(RTL_DIR)/rv_icache.sv $(RTL_DIR)/rv_dcache.sv \
-      $(RTL_DIR)/uart_tx.sv $(RTL_DIR)/rv_soc.sv
+      $(RTL_DIR)/uart_tx.sv $(RTL_DIR)/rv_clint.sv $(RTL_DIR)/rv_soc.sv
 
 OBJ ?= obj_dir
 

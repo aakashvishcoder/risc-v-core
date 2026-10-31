@@ -3,10 +3,13 @@
 //
 // Memory map
 //   0x0000_0000 - 0x0000_FFFF  RAM (code + data + stack)
+//   0x0200_0000  CLINT         : msip, mtimecmp, mtime (rv_clint.sv)
 //   0x1000_0000  UART_DATA  W  : transmit byte (dropped if UART busy)
 //   0x1000_0004  UART_STAT  R  : bit0 = transmitter busy
 //   0x1000_0008  SIM_EXIT   W  : end simulation with exit code (testbench)
 //   0x1000_000C  LEDS       RW : LED outputs
+//   0x1000_0010  EXT_IRQ    RW : bit0 drives the external interrupt line (a
+//                                test hook: software can interrupt itself)
 // Any other data address raises an access fault in the core.
 //
 // Memory system
@@ -33,7 +36,8 @@ module rv_soc #(
   parameter int    IC_LINES     = 128,     // I-cache lines (16 B each): 2 KiB
   parameter int    DC_SETS      = 64,      // D-cache sets, 0 = no D-cache
   parameter int    DC_WAYS      = 2,       // D-cache ways (1 or 2); lines are 16 B: 2 KiB
-  parameter int    MEM_LATENCY  = 20       // main memory latency (CACHES = 1)
+  parameter int    MEM_LATENCY  = 20,      // main memory latency (CACHES = 1)
+  parameter int    TICK_DIV     = 1        // clock cycles per mtime tick
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -67,6 +71,7 @@ module rv_soc #(
   logic [3:0]  dmem_we;
   logic        dmem_re, dmem_stall;
   logic        ev_icache_miss, ev_dcache_miss, ev_dcache_wb;
+  logic        irq_timer, irq_soft, irq_ext;
 
   rv_core #(
     .EARLY_JAL (EARLY_JAL != 0), .BPRED (BPRED), .BHT_BITS (BHT_BITS), .GHR_BITS (GHR_BITS),
@@ -77,6 +82,7 @@ module rv_soc #(
     .imem_addr, .imem_rdata, .imem_pc, .imem_valid, .imem_lookup, .imem_kill,
     .dmem_addr, .dmem_wdata, .dmem_we, .dmem_re, .dmem_rdata, .dmem_stall,
     .ev_icache_miss, .ev_dcache_miss, .ev_dcache_wb,
+    .irq_timer, .irq_soft, .irq_ext,
     .commit_valid, .commit_pc, .commit_instr,
     .commit_rd_we, .commit_rd, .commit_rd_val,
     .commit_trap, .commit_cause, .commit_tval
@@ -84,6 +90,7 @@ module rv_soc #(
 
   wire sel_ram = (dmem_addr[31:AW+2] == '0);
   wire sel_io  = (dmem_addr[31:8] == 24'h10_0000);
+  wire sel_clint = (dmem_addr[31:16] == 16'h0200);
   wire ram_acc = sel_ram && (dmem_re || dmem_we != 4'b0);   // EX has a RAM access
 
   logic [31:0] ram_rdata;
@@ -204,6 +211,24 @@ module rv_soc #(
   wire  wr_uart    = io_wr && dmem_addr[7:0] == 8'h00;
   wire  wr_exit    = io_wr && dmem_addr[7:0] == 8'h08;
   wire  wr_leds    = io_wr && dmem_addr[7:0] == 8'h0C;
+  wire  wr_extirq  = io_wr && dmem_addr[7:0] == 8'h10;
+
+  // ---------------- CLINT ----------------
+  logic [31:0] clint_rdata;
+  rv_clint #(.TICK_DIV(TICK_DIV)) u_clint (
+    .clk, .rst,
+    .sel       (sel_clint),
+    .addr      (dmem_addr[15:0]),
+    .we        (dmem_we),
+    .wdata     (dmem_wdata),
+    .rdata     (clint_rdata),
+    .irq_timer (irq_timer),
+    .irq_soft  (irq_soft)
+  );
+
+  always_ff @(posedge clk)
+    if (rst)            irq_ext <= 1'b0;
+    else if (wr_extirq && dmem_we[0]) irq_ext <= dmem_wdata[0];
 
   generate
     if (CLKS_PER_BIT == 0) begin : g_sim_uart
@@ -230,17 +255,19 @@ module rv_soc #(
     else if (wr_leds) leds <= dmem_wdata[7:0];
 
   // Registered read mux to match the RAM's one-cycle read latency
-  logic        rd_io_q;
+  logic        rd_io_q, rd_clint_q;
   logic [31:0] io_rdata_q;
   always_ff @(posedge clk) begin
-    rd_io_q <= sel_io;
+    rd_io_q    <= sel_io;
+    rd_clint_q <= sel_clint;
     unique case (dmem_addr[7:0])
       8'h04:   io_rdata_q <= {31'b0, uart_busy};
       8'h0C:   io_rdata_q <= {24'b0, leds};
+      8'h10:   io_rdata_q <= {31'b0, irq_ext};
       default: io_rdata_q <= 32'b0;
     endcase
   end
 
-  assign dmem_rdata = rd_io_q ? io_rdata_q : ram_rdata;
+  assign dmem_rdata = rd_io_q ? io_rdata_q : rd_clint_q ? clint_rdata : ram_rdata;
 
 endmodule

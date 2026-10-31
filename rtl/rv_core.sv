@@ -33,6 +33,14 @@
 // mtval and redirects fetch to mtvec, exactly like a mispredicted branch. A
 // marker travels down MEM and WB in the squashed slot so the trap shows up in
 // the commit trace in program order.
+//
+// Interrupts are taken the same way, in place of the instruction in EX (so
+// mepc points at it and it runs after mret), when mstatus.MIE is set and an
+// interrupt is both pending and enabled in mie. Loads, stores and divides
+// aren't interrupted: they may already be waiting on memory or iterating, and
+// letting them finish keeps the memory system and divider simple. The next
+// instruction is interruptible, so the latency cost is at most one divide
+// or one cache miss.
 // ---------------------------------------------------------------------------
 module rv_core #(
   parameter logic [31:0] RESET_PC  = 32'h0000_0000,
@@ -67,6 +75,11 @@ module rv_core #(
   output logic        dmem_re,
   input  logic [31:0] dmem_rdata,
   input  logic        dmem_stall,   // the access in EX must wait (D-cache miss)
+
+  // Interrupt lines (level-sensitive): machine timer, software, external
+  input  logic        irq_timer,
+  input  logic        irq_soft,
+  input  logic        irq_ext,
 
   // Cache events for the performance counters (one pulse each)
   input  logic        ev_icache_miss,
@@ -471,7 +484,7 @@ module rv_core #(
   // -------------------------------------------------------------------------
   logic        mst_mie, mst_mpie;
   logic [31:0] mie_r, mtvec, mscratch, mepc, mcause, mtval, mcountinhibit;
-  wire  [31:0] mip = 32'b0;                       // no interrupt sources yet
+  wire  [31:0] mip = {20'b0, irq_ext, 3'b0, irq_timer, 3'b0, irq_soft, 3'b0};
   wire  [31:0] mstatus = {19'b0, 2'b11, 3'b0, mst_mpie, 3'b0, mst_mie, 3'b0};
 
   wire [11:0] csr_addr = ex.instr[31:20];
@@ -568,10 +581,20 @@ module rv_core #(
     else begin exc = 1'b0; exc_cause = 32'b0; end
   end
 
-  wire        trap_take   = ex.valid && exc;
-  wire [31:0] trap_cause  = exc_cause;
-  wire [31:0] trap_tval   = exc_tval;
-  wire [31:0] trap_vector = {mtvec[31:2], 2'b00};
+  // -------------------------------------------------------------------------
+  // Interrupts: highest priority external, then software, then timer
+  // -------------------------------------------------------------------------
+  wire [31:0] irq_pend = mip & mie_r;
+  wire [4:0]  irq_code = irq_pend[11] ? 5'd11 : irq_pend[3] ? 5'd3 : 5'd7;
+  wire irq_take = ex.valid && mst_mie && (irq_pend != 32'b0) &&
+                  !is_ls && !ex.c.is_div;
+
+  wire        trap_take   = irq_take || (ex.valid && exc);
+  wire [31:0] trap_cause  = irq_take ? {1'b1, 26'b0, irq_code} : exc_cause;
+  wire [31:0] trap_tval   = irq_take ? 32'b0 : exc_tval;
+  // Vectored mode sends interrupts to BASE + 4 * cause
+  wire [31:0] trap_vector = {mtvec[31:2], 2'b00} +
+                            ((irq_take && mtvec[0]) ? {25'b0, irq_code, 2'b00} : 32'b0);
 
   logic [31:0] ex_result;
   always_comb begin
