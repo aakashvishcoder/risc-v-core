@@ -13,16 +13,20 @@
 //   - Data   : full forwarding from MEM and WB into EX; regfile write-through
 //              covers WB -> ID. A load followed by a dependent instruction
 //              stalls one cycle (load-use).
-//   - Control: predict not-taken. Branches, JAL and JALR all resolve in EX;
-//              a taken branch or jump flushes the instruction in ID
-//              (1-cycle penalty).
+//   - Control: predict not-taken. Branches and JALR resolve in EX; a taken
+//              branch or a JALR flushes the instruction in ID (1-cycle
+//              penalty). JAL's target is pc + imm, known as soon as it's
+//              decoded, so with EARLY_JAL decode redirects fetch directly.
+//              Because IF is only an address phase, a redirect from ID costs
+//              nothing: the next address is chosen in the same cycle.
 //
 // Memories are synchronous-read (1 cycle), matching Xilinx block RAM. Because
 // of that, "IF" is just the address phase: the fetched word appears on
 // imem_rdata at the start of ID.
 // ---------------------------------------------------------------------------
 module rv_core #(
-  parameter logic [31:0] RESET_PC = 32'h0000_0000
+  parameter logic [31:0] RESET_PC  = 32'h0000_0000,
+  parameter bit          EARLY_JAL = 1'b1     // resolve JAL in decode (0-cycle penalty)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -253,7 +257,7 @@ module rv_core #(
   // differs from the decode-stage prediction (pred_taken); jumps whose target
   // wasn't already followed in decode redirect too.
   wire br_mispredict = ex.valid && ex.c.is_branch && (br_cond != ex.pred_taken);
-  wire jmp_redirect  = ex.valid && (ex.c.is_jal || ex.c.is_jalr);
+  wire jmp_redirect  = ex.valid && ((ex.c.is_jal && !EARLY_JAL) || ex.c.is_jalr);
   wire redirect_ex   = br_mispredict || jmp_redirect;
 
   logic [31:0] target_ex;
@@ -295,9 +299,8 @@ module rv_core #(
   //   [3:1]   branch predictor: 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
   //   [11:4]  return-address stack depth (0 = none)
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
-  // Features are added in later commits; for now every field reads 0.
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
-  wire [31:0] mconfig = 32'b0;
+  wire [31:0] mconfig = {31'b0, EARLY_JAL};
 
   // CSR reads (read-only counters)
   logic [31:0] csr_val;
@@ -348,11 +351,16 @@ module rv_core #(
   // -------------------------------------------------------------------------
   // Fetch PC
   // -------------------------------------------------------------------------
+  // Decode-stage redirect: follow a JAL as soon as it's decoded
+  wire        redirect_id = EARLY_JAL && c_d.is_jal;
+  wire [31:0] target_id   = pc_d + imm_j;
+
   wire stall_d = load_use || halt_fetch;
   logic [31:0] fetch_pc;
   always_comb begin
-    if (redirect_ex)              fetch_pc = target_ex;
-    else if (!valid_d || stall_d) fetch_pc = pc_d;   // re-read same word
+    if (redirect_ex)              fetch_pc = target_ex;  // EX outranks ID: ID may be wrong-path
+    else if (!valid_d || stall_d) fetch_pc = pc_d;       // re-read same word
+    else if (redirect_id)         fetch_pc = target_id;
     else                          fetch_pc = pc_d + 32'd4;
   end
   assign imem_addr = fetch_pc;

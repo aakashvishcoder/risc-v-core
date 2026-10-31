@@ -11,7 +11,8 @@
 module rv_soc #(
   parameter int    MEM_WORDS    = 16384,
   parameter int    CLKS_PER_BIT = 434,    // 0 = instantaneous UART (simulation)
-  parameter string MEM_INIT     = ""
+  parameter string MEM_INIT     = "",
+  parameter int    EARLY_JAL    = 1        // core configuration: see rv_core.sv
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -38,7 +39,7 @@ module rv_soc #(
   logic [3:0]  dmem_we;
   logic        dmem_re;
 
-  rv_core u_core (
+  rv_core #(.EARLY_JAL(EARLY_JAL != 0)) u_core (
     .clk, .rst,
     .imem_addr, .imem_rdata,
     .dmem_addr, .dmem_wdata, .dmem_we, .dmem_re, .dmem_rdata,
