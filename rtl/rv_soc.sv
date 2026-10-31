@@ -13,8 +13,9 @@
 //               takes one cycle (what fits on the FPGA board's on-chip RAM).
 //   CACHES = 1: RAM is a slow main memory (MEM_LATENCY cycles per 16-byte
 //               line) behind an instruction cache and a write-back data cache
-//               (DC_SETS lines; DC_SETS = 0 leaves the data side uncached: one
-//               main-memory access per load/store). I/O is never cached.
+//               (DC_SETS x DC_WAYS lines; DC_SETS = 0 leaves the data side
+//               uncached: one main-memory access per load/store). I/O is never
+//               cached.
 // ---------------------------------------------------------------------------
 module rv_soc #(
   parameter int    MEM_WORDS    = 16384,
@@ -29,7 +30,8 @@ module rv_soc #(
   parameter int    M_EXT        = 2,
   parameter int    CACHES       = 0,       // memory system: see above
   parameter int    IC_LINES     = 64,      // I-cache lines (16 B each)
-  parameter int    DC_SETS      = 64,      // D-cache lines (16 B each), 0 = no D-cache
+  parameter int    DC_SETS      = 64,      // D-cache sets, 0 = no D-cache
+  parameter int    DC_WAYS      = 1,       // D-cache ways (1 or 2); lines are 16 B
   parameter int    MEM_LATENCY  = 20       // main memory latency (CACHES = 1)
 ) (
   input  logic        clk,
@@ -52,7 +54,7 @@ module rv_soc #(
 );
   localparam int AW = $clog2(MEM_WORDS);
   localparam logic [31:0] MCACHE = (CACHES == 0) ? 32'b0 :
-      {16'(MEM_LATENCY), 4'b0, 4'((DC_SETS > 0) ? $clog2(DC_SETS) : 0),
+      {16'(MEM_LATENCY), 4'($clog2(DC_WAYS)), 4'((DC_SETS > 0) ? $clog2(DC_SETS) : 0),
        4'($clog2(IC_LINES)), 4'b0001};
 
   logic [31:0] imem_addr, imem_rdata;
@@ -125,7 +127,7 @@ module rv_soc #(
 
       if (DC_SETS > 0) begin : g_dcache
         logic d_we;
-        rv_dcache #(.SETS(DC_SETS)) u_dcache (
+        rv_dcache #(.SETS(DC_SETS), .WAYS(DC_WAYS)) u_dcache (
           .clk, .rst,
           .req       (ram_acc),
           .addr      (dmem_addr),
