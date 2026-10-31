@@ -47,9 +47,10 @@ module rv_dcache #(
 
   logic [127:0]  data  [WAYS][SETS];
   logic [TW-1:0] tags  [WAYS][SETS];
-  logic          valid [WAYS][SETS];
-  logic          dirty [WAYS][SETS];
-  logic          lru   [SETS];              // way to replace next (2 ways)
+  // Status bits are packed vectors so reset is one assignment per way
+  logic [SETS-1:0] valid [WAYS];
+  logic [SETS-1:0] dirty [WAYS];
+  logic [SETS-1:0] lru;                     // way to replace next (2 ways)
 
   wire [IB-1:0] idx = addr[IB+3:4];
   wire [TW-1:0] tag = addr[31:IB+4];
@@ -104,12 +105,10 @@ module rv_dcache #(
   always_ff @(posedge clk) begin
     if (rst) begin
       state <= IDLE;
-      for (int i = 0; i < SETS; i++) begin
-        lru[i] <= 1'b0;
-        for (int w = 0; w < WAYS; w++) begin
-          valid[w][i] <= 1'b0;
-          dirty[w][i] <= 1'b0;
-        end
+      lru   <= '0;
+      for (int w = 0; w < WAYS; w++) begin
+        valid[w] <= '0;
+        dirty[w] <= '0;
       end
     end else begin
       unique case (state)

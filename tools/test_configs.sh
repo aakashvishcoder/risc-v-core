@@ -39,7 +39,8 @@ CONFIGS=(
 )
 MARCHES=(rv32i_zicsr rv32i_zmmul_zicsr rv32im_zicsr)
 
-# Build all configurations in parallel
+# Build the configurations, a few at a time (each Verilator C++ build is
+# memory-hungry; all of them at once can starve the compiler)
 objname() { tr ' +()$' '_p___' <<<"$1"; }
 mkdir -p "$ROOT/out"
 for c in "${CONFIGS[@]}"; do
@@ -48,6 +49,7 @@ for c in "${CONFIGS[@]}"; do
   make -s -C "$ROOT/sim" OBJ="obj_$o" EARLY_JAL=$ej BPRED=$bp BHT_BITS=$bht GHR_BITS=$ghr \
        RAS_DEPTH=$ras IBTB_BITS=$ib M_EXT=$m CACHES=$ca IC_LINES=$((ic>0?ic:128)) \
        DC_SETS=$dcs DC_WAYS=$((dcw>0?dcw:1)) > "$ROOT/out/build_$o.log" 2>&1 &
+  (( $(jobs -rp | wc -l) >= 4 )) && wait -n
 done
 wait
 

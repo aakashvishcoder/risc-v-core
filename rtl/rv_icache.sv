@@ -36,7 +36,7 @@ module rv_icache #(
 
   logic [127:0]  data  [LINES];
   logic [TW-1:0] tags  [LINES];
-  logic          valid [LINES];
+  logic [LINES-1:0] valid;                  // packed: resets in one assignment
 
   wire [IB-1:0] f_idx = fetch_addr[IB+3:4];
 
@@ -67,7 +67,7 @@ module rv_icache #(
   // Valid bits: cleared on reset
   always_ff @(posedge clk) begin
     if (rst) begin
-      for (int i = 0; i < LINES; i++) valid[i] <= 1'b0;
+      valid   <= '0;
       valid_q <= 1'b0;
     end else begin
       if (fill_we) valid[fill_idx] <= 1'b1;
