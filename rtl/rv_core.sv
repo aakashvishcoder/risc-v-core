@@ -29,7 +29,8 @@ module rv_core #(
   parameter bit          EARLY_JAL = 1'b1,    // resolve JAL in decode (0-cycle penalty)
   parameter int          BPRED     = 3,       // 0 not-taken, 1 BTFN, 2 bimodal, 3 gshare
   parameter int          BHT_BITS  = 8,       // log2(branch history table entries)
-  parameter int          GHR_BITS  = 8        // gshare global history length
+  parameter int          GHR_BITS  = 8,       // gshare global history length
+  parameter int          RAS_DEPTH = 8        // return-address stack entries (0 = none)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -87,6 +88,8 @@ module rv_core #(
     logic [31:0] imm;
     logic        pred_taken;   // decode predicted taken and already redirected
     logic [BHT_BITS-1:0] bht_idx;  // table entry used for the prediction
+    logic        jalr_pred;    // decode already followed a predicted JALR target
+    logic [31:0] jalr_target;  // ... and this is the target it followed
     ctrl_t       c;
   } idex_t;
 
@@ -261,12 +264,14 @@ module rv_core #(
   // differs from the decode-stage prediction (pred_taken); jumps whose target
   // wasn't already followed in decode redirect too.
   wire br_mispredict = ex.valid && ex.c.is_branch && (br_cond != ex.pred_taken);
-  wire jmp_redirect  = ex.valid && ((ex.c.is_jal && !EARLY_JAL) || ex.c.is_jalr);
+  wire [31:0] jalr_actual = (a_fwd + ex.imm) & ~32'd1;
+  wire jmp_redirect  = ex.valid && ((ex.c.is_jal && !EARLY_JAL) ||
+                                    (ex.c.is_jalr && !(ex.jalr_pred && ex.jalr_target == jalr_actual)));
   wire redirect_ex   = br_mispredict || jmp_redirect;
 
   logic [31:0] target_ex;
   always_comb begin
-    if (ex.c.is_jalr)                     target_ex = (a_fwd + ex.imm) & ~32'd1;
+    if (ex.c.is_jalr)                     target_ex = jalr_actual;
     else if (ex.c.is_branch && !br_cond)  target_ex = ex.pc + 32'd4;  // predicted taken, wasn't
     else                                  target_ex = ex.pc + ex.imm;
   end
@@ -315,7 +320,7 @@ module rv_core #(
   //   [11:4]  return-address stack depth (0 = none)
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
-  wire [31:0] mconfig = {28'b0, 3'(BPRED), EARLY_JAL};
+  wire [31:0] mconfig = {20'b0, 8'(RAS_DEPTH), 3'(BPRED), EARLY_JAL};
 
   // CSR reads (read-only counters)
   logic [31:0] csr_val;
@@ -411,9 +416,38 @@ module rv_core #(
     pred_taken_d = pred_taken_d && c_d.is_branch;
   end
 
-  // Decode-stage redirect: follow a JAL, or a branch predicted taken
-  wire        redirect_id = (EARLY_JAL && c_d.is_jal) || pred_taken_d;
-  wire [31:0] target_id   = pc_d + (c_d.is_jal ? imm_j : imm_b);
+  // -------------------------------------------------------------------------
+  // Return-address stack (decode stage)
+  // Uses the RISC-V hints for which registers are links (x1, x5):
+  //   JAL/JALR with rd = link                 push pc+4    (call)
+  //   JALR, rs1 = link, rd != link            pop          (return)
+  //   JALR, rd and rs1 both links, rd != rs1  pop, then push (coroutine swap)
+  // A popped address is a predicted target: decode redirects to it, and EX
+  // checks it against the real target. The stack is a circular buffer, so
+  // overflow overwrites the oldest entry and deep recursion simply
+  // mispredicts. It's updated only when an instruction leaves ID for EX, and
+  // everything that reaches EX retires, so it never sees wrong-path calls.
+  // -------------------------------------------------------------------------
+  localparam int RAS_N = (RAS_DEPTH > 0) ? RAS_DEPTH : 1;
+  localparam int RAS_W = (RAS_N > 1) ? $clog2(RAS_N) : 1;
+  logic [31:0]      ras [RAS_N];
+  logic [RAS_W-1:0] ras_top;               // index of the most recent entry
+
+  wire rd_link  = (rd_d  == 5'd1) || (rd_d  == 5'd5);
+  wire rs1_link = (rs1_d == 5'd1) || (rs1_d == 5'd5);
+  wire ras_pop  = (RAS_DEPTH > 0) && c_d.is_jalr && rs1_link && !(rd_link && rd_d == rs1_d);
+  wire ras_push = (RAS_DEPTH > 0) && (c_d.is_jal || c_d.is_jalr) && rd_link;
+  wire [RAS_W-1:0] ras_dec = (ras_top == '0) ? RAS_W'(RAS_N - 1) : ras_top - 1'b1;
+  wire [RAS_W-1:0] ras_inc = (ras_top == RAS_W'(RAS_N - 1)) ? '0 : ras_top + 1'b1;
+
+  wire        jalr_pred_d   = ras_pop;
+  wire [31:0] jalr_target_d = ras[ras_top];
+
+  // Decode-stage redirect: follow a JAL, a branch predicted taken, or a
+  // return predicted by the return-address stack
+  wire        redirect_id = (EARLY_JAL && c_d.is_jal) || pred_taken_d || jalr_pred_d;
+  wire [31:0] target_id   = jalr_pred_d ? jalr_target_d
+                                        : pc_d + (c_d.is_jal ? imm_j : imm_b);
 
   wire stall_d = load_use || halt_fetch;
   logic [31:0] fetch_pc;
@@ -453,6 +487,7 @@ module rv_core #(
       wb          <= '0;
       halt_fetch  <= 1'b0;
       halted      <= 1'b0;
+      ras_top     <= '0;
       cycle_ctr   <= '0;
       instret_ctr <= '0;
       for (int k = 0; k < NHPM; k++) hpm[k] <= '0;
@@ -465,6 +500,18 @@ module rv_core #(
       // IF -> ID
       pc_d    <= fetch_pc;
       valid_d <= 1'b1;
+
+      // Return-address stack: update as the instruction leaves ID for EX
+      if (valid_d && !stall_d && !redirect_ex) begin
+        if (ras_pop && ras_push) begin
+          ras[ras_top] <= pc_d + 32'd4;          // pop then push = replace top
+        end else if (ras_push) begin
+          ras[ras_inc] <= pc_d + 32'd4;
+          ras_top      <= ras_inc;
+        end else if (ras_pop) begin
+          ras_top      <= ras_dec;
+        end
+      end
 
       // ID -> EX
       if (redirect_ex || stall_d || !valid_d) begin
@@ -481,6 +528,8 @@ module rv_core #(
         ex.imm        <= imm_d;
         ex.pred_taken <= pred_taken_d;
         ex.bht_idx    <= bht_idx_d;
+        ex.jalr_pred   <= jalr_pred_d;
+        ex.jalr_target <= jalr_target_d;
         ex.c          <= c_d;
         if (c_d.trap) halt_fetch <= 1'b1;
       end

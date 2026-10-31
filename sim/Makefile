@@ -14,7 +14,9 @@ EARLY_JAL ?= 1
 BPRED     ?= 3
 BHT_BITS  ?= 8
 GHR_BITS  ?= 8
-PARAMS = -GEARLY_JAL=$(EARLY_JAL) -GBPRED=$(BPRED) -GBHT_BITS=$(BHT_BITS) -GGHR_BITS=$(GHR_BITS)
+RAS_DEPTH ?= 8
+PARAMS = -GEARLY_JAL=$(EARLY_JAL) -GBPRED=$(BPRED) -GBHT_BITS=$(BHT_BITS) -GGHR_BITS=$(GHR_BITS) \
+         -GRAS_DEPTH=$(RAS_DEPTH)
 VFLAGS = --cc --exe --build -j 0 -O3 --trace -Wall -Wno-fatal \
          -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM \
          -I$(RTL_DIR) +define+SIMULATION --top-module rv_soc \
