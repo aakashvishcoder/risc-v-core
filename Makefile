@@ -6,11 +6,12 @@
 #   make mutate      mutation testing (slow, ~6 min)
 #   make bench       CoreMark (10 iterations) with the CPI stack
 #   make study       trace-driven branch predictor study on CoreMark
+#   make cache-study trace-driven cache study on CoreMark and memstream
 SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: test test-quick test-configs bench-configs mutate bench study sim hello progs clean
+.PHONY: test test-quick test-configs bench-configs mutate bench study cache-study sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -50,6 +51,19 @@ study:
 	@sim/obj_base/Vrv_soc +firmware=sw/build/study/coremark.hex +trace=out/study.rtl \
 	  >/dev/null 2>out/study.rtl.log
 	@python3 tools/bpred_study.py out/study.rtl
+
+# The cache study replays each program's fetch and load/store address streams
+# (fetches from the RTL commit trace, data addresses from the reference model)
+CACHE_PEN ?=
+cache-study: sim
+	@$(MAKE) -s -C sw PROG=coremark ITERATIONS=1 BUILD=build/cm1
+	@$(MAKE) -s -C sw PROG=memstream
+	@mkdir -p out
+	@for p in cm1/coremark memstream; do n=$$(basename $$p); \
+	  sim/obj_dir/Vrv_soc +firmware=sw/build/$$p.hex +trace=out/cs_$$n.rtl >/dev/null 2>&1; \
+	  PYTHONDONTWRITEBYTECODE=1 python3 tools/iss.py sw/build/$$p.hex --m --csr-sync out/cs_$$n.rtl \
+	    --mem-trace out/cs_$$n.mem >/dev/null 2>&1; \
+	  echo "=== $$n"; python3 tools/cache_study.py out/cs_$$n.rtl out/cs_$$n.mem $(CACHE_PEN); done
 
 test-configs:
 	@mkdir -p out && tools/test_configs.sh 30

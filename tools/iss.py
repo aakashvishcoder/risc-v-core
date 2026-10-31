@@ -10,6 +10,7 @@ same commit trace format as the Verilator testbench:
 so the two can be diffed line by line (tools/compare.py).
 
 Usage: iss.py prog.hex [--trace out.txt] [--max N] [--m] [--csr-sync rtl_trace]
+                      [--mem-trace mem.txt]
 """
 import argparse
 import sys
@@ -40,9 +41,12 @@ class ISS:
         self.leds = 0
         self.exit_code = None
         self.csr_sync = {}   # instret index -> CSR value observed by the RTL
+        self.mtrace = None   # optional file: one line per RAM load/store
 
     # ---- memory (mirrors the rv_soc memory map) ---------------------------
     def load(self, addr, size):
+        if self.mtrace and addr >> 28 == 0:
+            self.mtrace.write(f"L {addr:08x}\n")
         if addr >> 28 == 1:
             off = addr & 0xFF
             if off == 0x04:
@@ -54,6 +58,8 @@ class ISS:
         return int.from_bytes(self.mem[a:a + size], "little")
 
     def store(self, addr, size, val):
+        if self.mtrace and addr >> 28 == 0:
+            self.mtrace.write(f"S {addr:08x}\n")
         if addr >> 28 == 1:
             off = addr & 0xFC
             lane = (val << (8 * (addr & 3))) & MASK   # sub-word stores use their byte lane
@@ -200,6 +206,7 @@ def main():
     ap.add_argument("--max", type=int, default=50_000_000)
     ap.add_argument("--m", action="store_true", help="enable M extension")
     ap.add_argument("--csr-sync", help="RTL trace to take CSR read values from")
+    ap.add_argument("--mem-trace", help="write every RAM load/store address here")
     args = ap.parse_args()
 
     sim = ISS(read_hex(args.hex), m_ext=args.m)
@@ -209,6 +216,8 @@ def main():
             if len(p) == 3 and (int(p[1], 16) & 0x7F) == 0x73:
                 sim.csr_sync[i] = int(p[2].split("=")[1], 16)
 
+    if args.mem_trace:
+        sim.mtrace = open(args.mem_trace, "w")
     tf = open(args.trace, "w") if args.trace else None
     why = "timeout"
     try:
