@@ -6,7 +6,7 @@ SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: test test-quick mutate sim hello clean
+.PHONY: test test-quick mutate sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -14,11 +14,15 @@ sim:
 hello:
 	$(MAKE) -s -C sw PROG=hello
 
-test: sim hello
+PROGS = hello perftest
+progs:
+	@for p in $(PROGS); do $(MAKE) -s -C sw PROG=$$p || exit 1; done
+
+test: sim progs
 	@echo "== reference model known-answer tests"
 	@PYTHONDONTWRITEBYTECODE=1 python3 tools/test_iss.py | tail -1
 	@echo "== directed programs (RTL vs reference model)"
-	@tools/cosim.sh sw/build/hello.hex
+	@for p in $(PROGS); do tools/cosim.sh sw/build/$$p.hex || exit 1; done
 	@echo "== random programs"
 	@tools/run_random.sh $(SEEDS) 1
 

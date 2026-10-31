@@ -31,7 +31,8 @@ void printf_(const char *fmt, ...) {
     if (*fmt != '%') { putchar_(*fmt); continue; }
     fmt++;
     char pad = ' ';
-    int width = 0;
+    int width = 0, left = 0;
+    if (*fmt == '-') { left = 1; fmt++; }
     if (*fmt == '0') { pad = '0'; fmt++; }
     while (*fmt >= '0' && *fmt <= '9') width = width * 10 + (*fmt++ - '0');
     switch (*fmt) {
@@ -43,7 +44,15 @@ void printf_(const char *fmt, ...) {
       }
       case 'u': print_uint(va_arg(ap, uint32_t), 10, width, pad); break;
       case 'x': print_uint(va_arg(ap, uint32_t), 16, width, pad); break;
-      case 's': puts_(va_arg(ap, const char *)); break;
+      case 's': {
+        const char *s = va_arg(ap, const char *);
+        int len = 0;
+        while (s[len]) len++;
+        if (!left) for (int k = len; k < width; k++) putchar_(' ');
+        puts_(s);
+        if (left)  for (int k = len; k < width; k++) putchar_(' ');
+        break;
+      }
       case 'c': putchar_((char)va_arg(ap, int)); break;
       case '%': putchar_('%'); break;
       default: break;
