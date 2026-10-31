@@ -423,6 +423,18 @@ module rv_core #(
   assign perf_ev[13] = ev_dcache_wb;
   assign perf_ev[14] = trap_take;
 
+  // Events that put a bubble into EX (load-use, multiply-use, I-cache stalls,
+  // flushes and their causes) are counted one cycle late: in the cycle the
+  // bubble occupies EX, which is the cycle it costs. Everything else (EX
+  // stalls, branches, traps) already happens in the cycle it describes. With
+  // every event lined up with its cycle, the accounting identity holds exactly
+  // over any window of cycles - in particular between the two mcountinhibit
+  // writes that start and stop a measurement - even when a bubble is created
+  // in the window's first or last cycle.
+  localparam logic [NHPM-1:0] EV_LATE = NHPM'(15'b000_0010_1110_0011);   // 0,1,5,6,7,9
+  logic [NHPM-1:0] perf_ev_q;
+  always_ff @(posedge clk) perf_ev_q <= rst ? '0 : perf_ev;
+  wire  [NHPM-1:0] perf_cnt = (perf_ev & ~EV_LATE) | (perf_ev_q & EV_LATE);
 
   // Read-only configuration register in the custom machine CSR space, so
   // software (tests, benchmarks) can tell which features this build has.
@@ -803,7 +815,7 @@ module rv_core #(
       for (int k = 0; k < NHPM; k++) begin
         if (csr_wr(12'hB03 + k[11:0]))      hpm[k] <= {hpm[k][63:32], csr_new};
         else if (csr_wr(12'hB83 + k[11:0])) hpm[k] <= {csr_new, hpm[k][31:0]};
-        else if (perf_ev[k] && !mcountinhibit[3 + k]) hpm[k] <= hpm[k] + 64'd1;
+        else if (perf_cnt[k] && !mcountinhibit[3 + k]) hpm[k] <= hpm[k] + 64'd1;
       end
 
       // Trap entry, MRET, CSR writes (all from EX)

@@ -12,10 +12,11 @@
 //   flush cycles = branch mispredictions + jump redirects
 //   cycles       = instructions + load-use + multiply-use + divider stalls
 //                  + I-cache + D-cache stalls + flush cycles + constant
-// Each kernel runs twice and the second (warm) run is measured, so cold
-// instruction-cache misses in the measurement code itself can't skew it. On a
-// cached configuration the loops still take data misses; the counts above
-// don't change, and the identity accounts for the cache stalls.
+// The kernels freeze all counters while they read them (mcountinhibit), so
+// every counter covers exactly the same window and the constant is the same
+// for every kernel. Each kernel runs twice and the second (warm) run is
+// measured. On a cached configuration the loops still take cache misses; the
+// counts above don't change, and the identity accounts for the cache stalls.
 #include "rt.h"
 
 #define N 100
@@ -190,14 +191,8 @@ int main(void) {
     printf_("  %-20s cycles=%u = %u insns + %u ld-use + %u mul-use + %u div + %u I$ + %u D$ + %u flush (%u misp + %u jump) + %d\n",
             T->name, d[CYC], T->insns, d[LU], d[MU], d[DIV], d[ICS], d[DCS], d[FLUSH], d[MISP],
             d[JREDIR], slack);
-    // The counters are read one after another, not at the same instant, so an
-    // instruction-cache miss in the middle of the reads (the measurement code
-    // can be evicted by the caller between runs) lands in some counters'
-    // windows and not others. Allow exactly that much; everything else must
-    // match exactly. (mcountinhibit, once CSR writes exist, would remove this.)
-    int32_t dev = slack - slack0;
-    if (dev < 0) dev = -dev;
-    if ((uint32_t)dev > d[ICS] || slack0 < 0 || slack0 > 16) {
+    // All counters cover the same window, so the constant must match exactly
+    if (slack != slack0 || slack0 < 0 || slack0 > 16) {
       printf_("  FAIL %s: cycle accounting constant %d differs (expected %d)\n", T->name,
               slack, slack0);
       ok = 0;

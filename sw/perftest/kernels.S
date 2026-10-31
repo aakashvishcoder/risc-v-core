@@ -8,13 +8,17 @@
 #   [8] multiply-use stalls  [9] divider stall cycles
 #   [10] I-cache stall cycles  [11] D-cache stall cycles
 #
-# Snapshots read the counters in the same order at the start and the end, so
-# each counter is sampled the same distance from its own reads and the
-# per-counter offsets cancel.
+# Every snapshot freezes all counters (mcountinhibit), reads them, and lets
+# them run again. So every counter covers exactly the same window - from the
+# write that unfreezes them at the start to the write that freezes them at the
+# end - however long the reads themselves take (an instruction-cache miss in
+# the middle of them, a slow store) and in whatever order they happen.
 
 #define N 100
 
 .macro SNAP
+    li   t0, -1
+    csrw mcountinhibit, t0
     csrr s2, cycle
     csrr s3, hpmcounter3
     csrr s4, hpmcounter4
@@ -27,6 +31,7 @@
     csrr s11, hpmcounter11
     csrr s0, hpmcounter12
     csrr s1, hpmcounter13
+    csrw mcountinhibit, zero
 .endm
 
 .macro DIFF1 now, saved, off
@@ -34,10 +39,9 @@
     sw   \now, \off(a0)
 .endm
 
-# Read every counter first, then subtract and store: with a slow memory, a
-# store between two counter reads would land in some counters' windows and
-# not others.
 .macro DIFF
+    li   t0, -1
+    csrw mcountinhibit, t0
     csrr t0, cycle
     csrr t1, hpmcounter3
     csrr t2, hpmcounter4
@@ -50,6 +54,7 @@
     csrr a3, hpmcounter11
     csrr a4, hpmcounter12
     csrr a5, hpmcounter13
+    csrw mcountinhibit, zero
     DIFF1 t0, s2, 0
     DIFF1 t1, s3, 4
     DIFF1 t2, s4, 8
