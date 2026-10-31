@@ -2,7 +2,8 @@
 
 A 5-stage pipelined RISC-V (RV32IM) processor written in SystemVerilog, with
 gshare branch prediction, a return-address stack, an indirect jump target
-buffer and a hardware multiplier and divider, built to run on my
+buffer, a hardware multiplier and divider, and optional instruction and
+write-back data caches in front of a slow main memory, built to run on my
 [Artix-7 FPGA carrier board](https://github.com/aakashvishcoder/fpgacarrierboard).
 
 ## Status
@@ -31,7 +32,7 @@ printing that took 232 cycles, 201 instructions
 - [x] CoreMark port, hardware performance counters, branch predictor study
 - [x] Branch prediction: static, bimodal, gshare, return-address stack, indirect target buffer
 - [x] M extension: pipelined multiplier, iterative divider
-- [ ] Instruction and data caches in front of a slow main memory
+- [x] Instruction cache and 2-way write-back data cache in front of a slow main memory
 - [ ] Machine-mode traps, CSRs, timer interrupts
 - [ ] FPGA bring-up on the carrier board
 
@@ -55,19 +56,25 @@ make -C sim run HEX=../sw/build/hello.hex  # run it
 make test                                  # full test suite
 make bench                                 # CoreMark with a CPI breakdown
 make study                                 # branch predictor what-if study
-make test-configs                          # test every predictor configuration
+make cache-study                           # cache what-if study
+make test-configs                          # test every configuration
 make bench-configs                         # ... and benchmark each one
 ```
 
-The predictor is configurable at build time (defaults shown):
+The core is configurable at build time (defaults shown):
 
 ```
-make -C sim OBJ=obj_mine EARLY_JAL=1 BPRED=3 BHT_BITS=8 GHR_BITS=8 RAS_DEPTH=8 IBTB_BITS=4 M_EXT=2
+make -C sim OBJ=obj_mine EARLY_JAL=1 BPRED=3 BHT_BITS=8 GHR_BITS=8 RAS_DEPTH=8 IBTB_BITS=4 M_EXT=2 \
+            CACHES=0 IC_LINES=128 DC_SETS=64 DC_WAYS=2 MEM_LATENCY=20
 ```
 
 `BPRED` selects 0 = predict not-taken, 1 = static BTFN, 2 = bimodal, 3 = gshare.
 `M_EXT` selects 0 = no M extension, 1 = multiply only (Zmmul), 2 = full M.
-Software can read the configuration from the `mconfig` CSR (0xFC0). Programs
+`CACHES=0` is single-cycle on-chip RAM (what the FPGA board has); `CACHES=1`
+puts a slow main memory (`MEM_LATENCY` cycles per 16-byte line) behind an
+instruction cache of `IC_LINES` lines and a data cache of `DC_SETS` ×
+`DC_WAYS` lines (`DC_SETS=0`: no data cache). Software can read the
+configuration from the `mconfig` (0xFC0) and `mcache` (0xFC1) CSRs. Programs
 build for `rv32im` by default; pass `MARCH=rv32i_zicsr` (or
 `rv32i_zmmul_zicsr`) to `make -C sw` for a core without M.
 
