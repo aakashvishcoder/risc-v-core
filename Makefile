@@ -43,6 +43,10 @@ test: sim sim-cache progs
 	@tools/run_random.sh $(SEEDS) 1 --m
 	@echo "== random programs, caches + slow main memory"
 	@SIM=$(CURDIR)/$(CACHE_SIM) tools/run_random.sh $$(( $(SEEDS) / 2 )) 5000 --m
+	@echo "== random programs with exceptions and interrupts, single-cycle RAM"
+	@TRAPS=1 tools/run_random.sh $(SEEDS) 10000 --m
+	@echo "== random programs with exceptions and interrupts, caches + slow main memory"
+	@TRAPS=1 SIM=$(CURDIR)/$(CACHE_SIM) tools/run_random.sh $$(( $(SEEDS) / 2 )) 15000 --m
 
 test-quick:
 	@$(MAKE) -s test SEEDS=20

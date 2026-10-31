@@ -32,7 +32,24 @@ data cache, so lines are evicted and dirty lines written back constantly). It
 is filled with pseudo-random words first and checksummed at the end, so every
 store is checked too.
 
-    rand_test.py <seed> <out.S> [--n 400] [--m]
+With --traps, the program also takes exceptions and interrupts all the way
+through: a trap handler (that preserves every register the program uses) is
+installed, the CLINT timer fires at pseudo-random intervals of 40-295
+cycles, and the random stream includes
+
+  - ecall, ebreak, illegal instructions, unimplemented CSRs
+  - misaligned loads/stores (the destination register must keep its value)
+  - loads, stores and fetches outside the memory map
+  - jumps and taken branches to misaligned targets
+  - self-inflicted software and external interrupts
+  - toggling mstatus.MIE and mie, and reading mcause/mepc/mtval/mstatus/mip
+    into the hot registers, so the trap CSRs are compared too
+
+The handler skips a faulting instruction (mepc + 4), returns from a bad fetch
+to the link register of the jump that caused it, re-arms or clears the
+interrupt source, and counts every trap; the count goes into the checksum.
+
+    rand_test.py <seed> <out.S> [--n 400] [--m] [--traps]
 """
 import argparse
 import random
@@ -46,6 +63,12 @@ CALLSTACK = "x27" # spill area for the call chain
 CALLS = "x28"     # counts function bodies executed
 LOOP = "x29"      # loop counter
 TMP = "x30"       # temp for JALR targets and setup
+# --traps only
+HREGS = ["x13", "x14", "x15", "x16"]   # the trap handler's scratch (saved by it)
+CLINT = "x20"     # 0x0200_0000
+ONE = "x21"       # 1
+IOB = "x22"       # 0x1000_0000
+BAD = "x24"       # an unmapped address
 BASE = "x31"      # scratch-buffer base pointer
 SCRATCH = 2048    # bytes; offsets fit a load/store immediate
 
@@ -63,7 +86,14 @@ INTERESTING = [0, 1, -1, 2, 0x7FFFFFFF, -0x80000000, 0x80000000,
                31, 32, 33, 0xFF, 0xFFFF, 0x8000, 0x80]
 
 
-def gen(seed, n, m_ext):
+def enc_branch(f3, rs1, rs2, imm):
+    """Hand-encode a branch (assemblers refuse misaligned offsets)."""
+    imm &= 0x1FFF
+    return ((((imm >> 12) & 1) << 31) | (((imm >> 5) & 0x3F) << 25) | (rs2 << 20) |
+            (rs1 << 15) | (f3 << 12) | (((imm >> 1) & 0xF) << 8) | (((imm >> 11) & 1) << 7) | 0x63)
+
+
+def gen(seed, n, m_ext, traps=False):
     rnd = random.Random(seed)
     r = lambda: rnd.choice(POOL)
     rs = lambda: "x0" if rnd.random() < 0.1 else r()     # sometimes read x0
@@ -90,6 +120,47 @@ def gen(seed, n, m_ext):
             return f"{op} {rd_any()}, {rnd.randrange(0, SCRATCH, sz)}({BASE})"
         op, sz = rnd.choice(STORES)
         return f"{op} {rs()}, {rnd.randrange(0, SCRATCH, sz)}({BASE})"
+
+    def trap_op(i):
+        """Something that traps (or toggles what may trap)."""
+        k = rnd.randrange(15)
+        if k == 0:
+            return "ecall"
+        if k == 1:
+            return "ebreak"
+        if k == 2:
+            return rnd.choice([".word 0x00000000", ".word 0xffffffff", ".word 0x40b595b3",
+                               ".word 0x20200073", f"csrr {r()}, 0x7c0", f"csrw cycle, {r()}"])
+        if k == 3:
+            op, sz = rnd.choice([("lw", 4), ("lh", 2), ("lhu", 2)])
+            off = rnd.randrange(0, SCRATCH - 4, sz) + rnd.randrange(1, sz)
+            return f"{op} {r()}, {off}({BASE})"
+        if k == 4:
+            op, sz = rnd.choice([("sw", 4), ("sh", 2)])
+            off = rnd.randrange(0, SCRATCH - 4, sz) + rnd.randrange(1, sz)
+            return f"{op} {rs()}, {off}({BASE})"
+        if k == 5:
+            return rnd.choice([f"lw {r()}, 0({BAD})", f"sb {rs()}, 3({BAD})",
+                               f"lw {r()}, 256({IOB})"])      # just past the I/O page
+        if k == 6:   # fetch fault: the handler resumes at the link
+            return f"jalr {RA}, 0({BAD})"
+        if k == 7:   # misaligned jump target: the jalr traps and doesn't link
+            return f"la {TMP}, {fwd_label(i)}\n    jalr {rd_any()}, 2({TMP})"
+        if k == 8:   # taken (maybe) branch to pc + 6 / pc - 6
+            f3 = rnd.choice([0, 1, 4, 5, 6, 7])
+            a, b = (int(x[1:]) for x in (rs(), rs()))
+            return f".word {enc_branch(f3, a, b, rnd.choice([6, -6, 10])):#010x}"
+        if k == 9:
+            return f"sw {ONE}, 0({CLINT})"                    # software interrupt
+        if k == 10:
+            return f"sw {ONE}, 16({IOB})"                     # external interrupt
+        if k == 11:
+            return rnd.choice([f"csrrci {r()}, mstatus, 8", f"csrrsi {r()}, mstatus, 8",
+                               f"csrrsi {r()}, mstatus, 8"])
+        if k == 12:
+            return f"csrrw {r()}, mie, {r()}" if rnd.random() < 0.3 else \
+                   f"li {TMP}, 0x888\n    csrw mie, {TMP}"
+        return f"csrr {r()}, {rnd.choice(['mcause', 'mepc', 'mtval', 'mstatus', 'mip', 'mie'])}"
 
     def control_op(i):
         k = rnd.random()
@@ -135,6 +206,14 @@ def gen(seed, n, m_ext):
     for reg in POOL:
         v = rnd.choice(INTERESTING) if rnd.random() < 0.4 else rnd.getrandbits(32)
         out.append(f"    li {reg}, {v & 0xFFFFFFFF}")
+    if traps:
+        out += [f"    li {CLINT}, 0x02000000", f"    li {ONE}, 1",
+                f"    li {IOB}, 0x10000000", f"    li {BAD}, {rnd.choice([0x40000000, 0x00010000, 0x80000010])}",
+                f"    la {TMP}, T_handler\n    csrw mtvec, {TMP}",
+                f"    li {TMP}, {rnd.getrandbits(31) | 1}\n    sw {TMP}, T_lfsr, {JT}",
+                "    call T_arm",
+                f"    li {TMP}, 0x888\n    csrw mie, {TMP}",
+                "    csrsi mstatus, 8"]
 
     loop_id, loop_end = 0, None
     for i in range(n):
@@ -142,7 +221,10 @@ def gen(seed, n, m_ext):
         if loop_end is None and rnd.random() < 0.10:
             out.append(f"    li {LOOP}, {rnd.randint(2, 8)}\nLOOP{loop_id}:")
             loop_end = i + rnd.randint(3, 12)
-        out.append("    " + (control_op(i) if rnd.random() < 0.25 else data_op(i)))
+        if traps and rnd.random() < 0.08:
+            out.append("    " + trap_op(i))
+        else:
+            out.append("    " + (control_op(i) if rnd.random() < 0.25 else data_op(i)))
         if loop_end is not None and i >= loop_end:
             # count down; exit once <= 0 (also safe if entered with a stale count)
             out.append(f"    addi {LOOP}, {LOOP}, -1\n    blt x0, {LOOP}, LOOP{loop_id}")
@@ -155,6 +237,9 @@ def gen(seed, n, m_ext):
     out.append(f"2:  lw {TMP}, 0({JT})\n    add x10, x10, {TMP}\n    addi {JT}, {JT}, 4")
     out.append(f"    addi {LOOP}, {LOOP}, -1\n    bnez {LOOP}, 2b")
     out.append(f"    add x10, x10, {CALLS}")
+    if traps:
+        out.append("    csrci mstatus, 8")
+        out.append(f"    lw {TMP}, T_count\n    add x10, x10, {TMP}")
     out.append(f"    mv {RA}, {SAVED_RA}\n    li a0, 0\n    ret")
 
     # Functions
@@ -167,6 +252,79 @@ def gen(seed, n, m_ext):
                    f"    ret")
     out.append(f"F{CHAIN_DEPTH}:\n    addi {CALLS}, {CALLS}, 1\n    ret")
 
+    if traps:
+        h0, h1, h2, h3 = HREGS
+        out.append(f"""
+# Trap handler: preserves everything but its own scratch registers' values
+    .balign 4
+T_handler:
+    csrw mscratch, {h0}
+    la   {h0}, T_save
+    sw   {h1}, 0({h0})
+    sw   {h2}, 4({h0})
+    sw   {h3}, 8({h0})
+    lw   {h1}, 12({h0})          # count every trap
+    addi {h1}, {h1}, 1
+    sw   {h1}, 12({h0})
+    csrr {h1}, mcause
+    bltz {h1}, T_irq
+    li   {h2}, 1
+    bne  {h1}, {h2}, 1f
+    csrw mepc, {RA}              # bad fetch: back to the jump's link
+    j    T_done
+1:  csrr {h2}, mepc              # other exceptions: skip the instruction
+    addi {h2}, {h2}, 4
+    csrw mepc, {h2}
+    j    T_done
+T_irq:
+    andi {h1}, {h1}, 31
+    li   {h2}, 3
+    bne  {h1}, {h2}, 1f
+    sw   x0, 0({CLINT})          # software: clear msip
+    j    T_done
+1:  li   {h2}, 11
+    bne  {h1}, {h2}, 1f
+    sw   x0, 16({IOB})           # external: clear the line
+    j    T_done
+1:  jal  {h3}, T_arm_core        # timer: re-arm
+T_done:
+    lw   {h1}, 0({h0})
+    lw   {h2}, 4({h0})
+    lw   {h3}, 8({h0})
+    csrr {h0}, mscratch
+    mret
+
+# T_arm: arm the timer 40-295 cycles from now (setup only: called with ra)
+T_arm:
+    la   {h0}, T_save
+    jal  {h3}, T_arm_core
+    ret
+T_arm_core:                      # uses {h1}, {h2}; returns through {h3}
+    lw   {h1}, 20({h0})          # xorshift32
+    slli {h2}, {h1}, 13
+    xor  {h1}, {h1}, {h2}
+    srli {h2}, {h1}, 17
+    xor  {h1}, {h1}, {h2}
+    slli {h2}, {h1}, 5
+    xor  {h1}, {h1}, {h2}
+    sw   {h1}, 20({h0})
+    andi {h1}, {h1}, 255
+    addi {h1}, {h1}, 40
+    li   {h2}, 0x0200BFF8
+    lw   {h2}, 0({h2})           # mtime (low word)
+    add  {h1}, {h1}, {h2}
+    li   {h2}, 0x02004000
+    sw   {ONE}, 4({h2})          # hi = 1: nothing matches while lo changes
+    sw   {h1}, 0({h2})
+    sw   x0, 4({h2})
+    jr   {h3}
+
+    .data
+    .balign 4
+T_save:  .word 0, 0, 0
+T_count: .word 0
+         .word 0
+T_lfsr:  .word 0""")
     out.append(f"\n    .bss\n    .balign 16\nscratch: .space {SCRATCH}")
     out.append(f"callstack: .space {4 * CHAIN_DEPTH}")
     return "\n".join(out) + "\n"
@@ -178,8 +336,9 @@ def main():
     ap.add_argument("out")
     ap.add_argument("--n", type=int, default=400)
     ap.add_argument("--m", action="store_true", help="include M-extension instructions")
+    ap.add_argument("--traps", action="store_true", help="include exceptions and interrupts")
     a = ap.parse_args()
-    open(a.out, "w").write(gen(a.seed, a.n, a.m))
+    open(a.out, "w").write(gen(a.seed, a.n, a.m, a.traps))
 
 
 if __name__ == "__main__":

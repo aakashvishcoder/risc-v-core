@@ -3,6 +3,7 @@
 # diff the traces. Failing seeds are kept in out/ for debugging.
 #   tools/run_random.sh [count=100] [first_seed=1] [--m]
 # Env: KEEP_FAILS=0 to discard failing programs (used by mutate.py)
+#      TRAPS=1 for programs that also take exceptions and interrupts
 set -uo pipefail
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 COUNT="${1:-100}"
@@ -15,11 +16,12 @@ export PYTHONDONTWRITEBYTECODE=1
 # let it write a multi-GB trace.
 export MAX_CYCLES="${MAX_CYCLES:-1000000}"
 KEEP_FAILS="${KEEP_FAILS:-1}"
+[[ "${TRAPS:-0}" == 0 ]] && unset TRAPS
 
 GEN="$ROOT/sw/gen_rand"; mkdir -p "$GEN" "$ROOT/out"
 pass=0; fail=0
 for ((s=FIRST; s<FIRST+COUNT; s++)); do
-  python3 "$ROOT/tools/rand_test.py" "$s" "$GEN/main.S" $MFLAG
+  python3 "$ROOT/tools/rand_test.py" "$s" "$GEN/main.S" $MFLAG ${TRAPS:+--traps}
   if ! make -s -C "$ROOT/sw" PROG=gen_rand BUILD=build/rand MARCH="$MARCH" >/dev/null 2>&1; then
     echo "seed $s: build failed"; fail=$((fail+1)); continue
   fi
