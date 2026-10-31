@@ -36,8 +36,8 @@ volatile ee_s32 seed5_volatile = 0;
 
 #define CSRR(name) ({ ee_u32 v_; __asm__ volatile("csrr %0, " #name : "=r"(v_)); v_; })
 
-/* cycle, instret, hpmcounter3..11 */
-#define NCTR 11
+/* cycle, instret, hpmcounter3..16 */
+#define NCTR 16
 static ee_u32 t_start[NCTR], t_stop[NCTR];
 
 static void snapshot(ee_u32 *s) {
@@ -52,6 +52,11 @@ static void snapshot(ee_u32 *s) {
   s[8] = CSRR(hpmcounter9);
   s[9] = CSRR(hpmcounter10);
   s[10] = CSRR(hpmcounter11);
+  s[11] = CSRR(hpmcounter12);
+  s[12] = CSRR(hpmcounter13);
+  s[13] = CSRR(hpmcounter14);
+  s[14] = CSRR(hpmcounter15);
+  s[15] = CSRR(hpmcounter16);
 }
 
 void start_time(void) { snapshot(t_start); }
@@ -89,7 +94,7 @@ void portable_fini(core_portable *p) {
   ee_u32 d[NCTR];
   for (int i = 0; i < NCTR; i++) d[i] = t_stop[i] - t_start[i];
   ee_u32 cycles = d[0], insns = d[1];
-  ee_u32 other = cycles - insns - d[2] - d[9] - d[10] - d[3];
+  ee_u32 other = cycles - insns - d[2] - d[9] - d[10] - d[11] - d[12] - d[3];
 
   ee_printf("\nrisc-v-core: %u iterations, %u cycles, %u instructions\n",
             (unsigned)ITERATIONS, (unsigned)cycles, (unsigned)insns);
@@ -100,6 +105,8 @@ void portable_fini(core_portable *p) {
   print_pct("load-use stalls      ", d[2], cycles);
   print_pct("multiply-use stalls  ", d[9], cycles);
   print_pct("divider stalls       ", d[10], cycles);
+  print_pct("I-cache stalls       ", d[11], cycles);
+  print_pct("D-cache stalls       ", d[12], cycles);
   print_pct("branch/jump flushes  ", d[3], cycles);
   print_pct("other                ", other, cycles);
   ee_printf("Control flow:\n");
@@ -107,4 +114,10 @@ void portable_fini(core_portable *p) {
   print_pct("mispredicted branches", d[7], d[4]);
   print_pct("redirected jumps     ", d[8], d[6]);
   ee_printf("  branches %u, jumps %u\n", (unsigned)d[4], (unsigned)d[6]);
+  ee_u32 mcache = CSRR(0xFC1);
+  if (mcache & 1) {
+    ee_printf("Caches (main memory latency %u):\n", (unsigned)(mcache >> 16));
+    ee_printf("  I-cache misses %u, D-cache misses %u, D-cache writebacks %u\n",
+              (unsigned)d[13], (unsigned)d[14], (unsigned)d[15]);
+  }
 }

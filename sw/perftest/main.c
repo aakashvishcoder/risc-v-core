@@ -11,15 +11,19 @@
 // counts are only reported. Two identities are checked for every kernel:
 //   flush cycles = branch mispredictions + jump redirects
 //   cycles       = instructions + load-use + multiply-use + divider stalls
-//                  + flush cycles + constant
+//                  + I-cache + D-cache stalls + flush cycles + constant
+// Each kernel runs twice and the second (warm) run is measured, so cold
+// instruction-cache misses in the measurement code itself can't skew it. On a
+// cached configuration the loops still take data misses; the counts above
+// don't change, and the identity accounts for the cache stalls.
 #include "rt.h"
 
 #define N 100
 
-enum { CYC, LU, FLUSH, BR, TAKEN, JUMPS, MISP, JREDIR, MU, DIV, NEV };
+enum { CYC, LU, FLUSH, BR, TAKEN, JUMPS, MISP, JREDIR, MU, DIV, ICS, DCS, NEV };
 static const char *names[NEV] = {"cycles", "load-use", "flush", "branches", "taken",
                                  "jumps", "mispredicts", "jump redirects", "mul-use",
-                                 "divider stalls"};
+                                 "divider stalls", "I-cache stalls", "D-cache stalls"};
 
 // Divider latency (rv_divider.sv): one cycle to start plus one per quotient
 // bit; divide by zero finishes in the start cycle
@@ -146,12 +150,13 @@ int main(void) {
   for (unsigned t = 0; t < ntests; t++) {
     const struct test *T = &tests[t];
     uint32_t d[NEV];
+    T->fn(d);                // warm-up
     T->fn(d);
     int ok = 1;
 
-    uint32_t exact[NEV] = {0, T->lu, 0, T->br, T->taken, T->jumps, 0, 0, T->mu, T->div};
+    uint32_t exact[NEV] = {0, T->lu, 0, T->br, T->taken, T->jumps, 0, 0, T->mu, T->div, 0, 0};
     for (int k = LU; k < NEV; k++) {
-      if (k == FLUSH || k == MISP || k == JREDIR) continue;
+      if (k == FLUSH || k == MISP || k == JREDIR || k == ICS || k == DCS) continue;
       if (d[k] != exact[k]) {
         printf_("  FAIL %s: %s = %u, expected %u\n", T->name, names[k], d[k], exact[k]);
         ok = 0;
@@ -173,11 +178,20 @@ int main(void) {
       ok = 0;
     }
     // Cycle accounting: the snapshot code adds the same constant to every kernel
-    int32_t slack = (int32_t)(d[CYC] - (T->insns + d[LU] + d[MU] + d[DIV] + d[FLUSH]));
+    int32_t slack = (int32_t)(d[CYC] - (T->insns + d[LU] + d[MU] + d[DIV] + d[ICS] + d[DCS] +
+                                        d[FLUSH]));
     if (t == 0) slack0 = slack;
-    printf_("  %-20s cycles=%u = %u insns + %u load-use + %u mul-use + %u div + %u flush (%u misp + %u jump) + %d\n",
-            T->name, d[CYC], T->insns, d[LU], d[MU], d[DIV], d[FLUSH], d[MISP], d[JREDIR], slack);
-    if (slack != slack0 || slack < 0 || slack > 16) {
+    printf_("  %-20s cycles=%u = %u insns + %u ld-use + %u mul-use + %u div + %u I$ + %u D$ + %u flush (%u misp + %u jump) + %d\n",
+            T->name, d[CYC], T->insns, d[LU], d[MU], d[DIV], d[ICS], d[DCS], d[FLUSH], d[MISP],
+            d[JREDIR], slack);
+    // The counters are read one after another, not at the same instant, so an
+    // instruction-cache miss in the middle of the reads (the measurement code
+    // can be evicted by the caller between runs) lands in some counters'
+    // windows and not others. Allow exactly that much; everything else must
+    // match exactly. (mcountinhibit, once CSR writes exist, would remove this.)
+    int32_t dev = slack - slack0;
+    if (dev < 0) dev = -dev;
+    if ((uint32_t)dev > d[ICS] || slack0 < 0 || slack0 > 16) {
       printf_("  FAIL %s: cycle accounting constant %d differs (expected %d)\n", T->name,
               slack, slack0);
       ok = 0;

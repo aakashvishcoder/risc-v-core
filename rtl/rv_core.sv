@@ -32,7 +32,8 @@ module rv_core #(
   parameter int          GHR_BITS  = 8,       // gshare global history length
   parameter int          RAS_DEPTH = 8,       // return-address stack entries (0 = none)
   parameter int          IBTB_BITS = 4,       // log2(indirect jump target buffer entries), 0 = none
-  parameter int          M_EXT     = 2        // 0 none, 1 Zmmul (multiply only), 2 full M
+  parameter int          M_EXT     = 2,       // 0 none, 1 Zmmul (multiply only), 2 full M
+  parameter logic [31:0] MCACHE    = 32'b0    // cache geometry, reported in the mcache CSR
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -40,6 +41,10 @@ module rv_core #(
   // Instruction memory (sync read: rdata is valid the cycle after addr)
   output logic [31:0] imem_addr,
   input  logic [31:0] imem_rdata,
+  input  logic        imem_valid,   // imem_rdata holds the instruction at pc_d (I-cache hit)
+  output logic [31:0] imem_pc,      // pc_d: address imem_rdata should belong to
+  output logic        imem_lookup,  // ID holds a real fetch (for the I-cache)
+  output logic        imem_kill,    // ... which is being flushed this cycle
 
   // Data memory (sync read)
   output logic [31:0] dmem_addr,
@@ -47,6 +52,12 @@ module rv_core #(
   output logic [3:0]  dmem_we,
   output logic        dmem_re,
   input  logic [31:0] dmem_rdata,
+  input  logic        dmem_stall,   // the access in EX must wait (D-cache miss)
+
+  // Cache events for the performance counters (one pulse each)
+  input  logic        ev_icache_miss,
+  input  logic        ev_dcache_miss,
+  input  logic        ev_dcache_wb,
 
   // Retirement port (for tracing / verification)
   output logic        commit_valid,
@@ -137,7 +148,10 @@ module rv_core #(
   logic [31:0] pc_d;         // PC of the instruction on imem_rdata
   logic        valid_d;
 
-  wire [31:0] instr_d = valid_d ? imem_rdata : INSTR_NOP;
+  // valid_i: ID holds a real instruction. A fetch that missed in the
+  // instruction cache is treated exactly like no fetch at all.
+  wire        valid_i = valid_d && imem_valid;
+  wire [31:0] instr_d = valid_i ? imem_rdata : INSTR_NOP;
   wire [6:0]  opcode  = instr_d[6:0];
   wire [4:0]  rd_d    = instr_d[11:7];
   wire [2:0]  f3_d    = instr_d[14:12];
@@ -332,22 +346,36 @@ module rv_core #(
   //                                 to the wrong target)
   //  10  multiply-use stall cycles ID held because EX has a multiply it depends on
   //  11  divider stall cycles      EX busy with a divide
+  //  12  I-cache stall cycles      ID empty because its fetch missed
+  //  13  D-cache stall cycles      EX waiting for a data-cache miss
+  //  14  I-cache misses
+  //  15  D-cache misses
+  //  16  D-cache dirty writebacks
   // Every flush is one or the other, so event 4 == event 8 + event 9, and
-  //   cycles = instret + load-use + multiply-use + divider stalls + flushes + fill.
+  //   cycles = instret + load-use + multiply-use + divider + I-cache + D-cache
+  //            stalls + flushes + fill.
   // -------------------------------------------------------------------------
-  localparam int NHPM = 9;               // hpmcounter3 .. hpmcounter11
+  localparam int NHPM = 14;              // hpmcounter3 .. hpmcounter16
   logic [NHPM-1:0] perf_ev;
   logic [63:0]     hpm [NHPM];
 
-  assign perf_ev[0] = valid_d && load_use && !redirect_ex && !halt_fetch;
+  // Each lost cycle has exactly one cause: a load waiting in EX on a cache
+  // miss is a D-cache stall, not also a load-use stall for the instruction
+  // behind it.
+  assign perf_ev[0] = valid_i && load_use && !redirect_ex && !ex_stall && !halt_fetch;
   assign perf_ev[1] = redirect_ex;
   assign perf_ev[2] = ex.valid && ex.c.is_branch;
   assign perf_ev[3] = ex.valid && ex.c.is_branch && br_cond;
   assign perf_ev[4] = ex.valid && (ex.c.is_jal || ex.c.is_jalr);
   assign perf_ev[5] = br_mispredict;
   assign perf_ev[6] = jmp_redirect;
-  assign perf_ev[7] = valid_d && mul_use && !redirect_ex && !halt_fetch;
-  assign perf_ev[8] = ex_stall;
+  assign perf_ev[7] = valid_i && mul_use && !redirect_ex && !ex_stall && !halt_fetch;
+  assign perf_ev[8]  = div_stall;
+  assign perf_ev[9]  = valid_d && !imem_valid && !redirect_ex && !ex_stall && !halt_fetch;
+  assign perf_ev[10] = mem_stall;
+  assign perf_ev[11] = ev_icache_miss;
+  assign perf_ev[12] = ev_dcache_miss;
+  assign perf_ev[13] = ev_dcache_wb;
 
   // Read-only configuration register in the custom machine CSR space, so
   // software (tests, benchmarks) can tell which features this build has.
@@ -359,6 +387,10 @@ module rv_core #(
   //   [23:20] gshare global history length
   //   [25:24] M extension: 0 none, 1 Zmmul (multiply only), 2 full M
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
+  // mcache (0xFC1): [0] caches present, [7:4] log2(I-cache lines),
+  //   [11:8] log2(D-cache sets), [15:12] log2(D-cache ways),
+  //   [31:16] main memory latency. Lines are 16 bytes.
+  localparam logic [11:0] CSR_MCACHE  = 12'hFC1;
   wire [31:0] mconfig = {6'b0, 2'(M_EXT), 4'(GHR_BITS), 4'(BHT_BITS), 4'(IBTB_BITS),
                          8'(RAS_DEPTH), 3'(BPRED), EARLY_JAL};
 
@@ -373,6 +405,7 @@ module rv_core #(
       12'h301:                   csr_val = (M_EXT >= 2) ? 32'h4000_1100    // misa: RV32IM
                                                     : 32'h4000_0100;   //       RV32I
       CSR_MCONFIG:               csr_val = mconfig;
+      CSR_MCACHE:                csr_val = MCACHE;
       default:                   csr_val = 32'b0;          // mhartid etc.
     endcase
     // hpmcounterN / mhpmcounterN (low halves at C0N/B0N, high at C8N/B8N)
@@ -413,7 +446,10 @@ module rv_core #(
   logic [31:0] div_result;
   wire div_pending = (M_EXT >= 2) && ex.valid && ex.c.is_div;
   wire div_start   = div_pending && !div_issued && !halted;
-  wire ex_stall    = div_pending && !(div_issued && div_done);
+  wire div_stall   = div_pending && !(div_issued && div_done);
+  // A load or store in EX that misses in the data cache waits there too
+  wire mem_stall   = ex.valid && (ex.c.is_load || ex.c.is_store) && dmem_stall;
+  wire ex_stall    = div_stall || mem_stall;
 
   generate
     if (M_EXT >= 2) begin : g_div
@@ -555,11 +591,14 @@ module rv_core #(
   logic [31:0] fetch_pc;
   always_comb begin
     if (redirect_ex)              fetch_pc = target_ex;  // EX outranks ID: ID may be wrong-path
-    else if (!valid_d || stall_d) fetch_pc = pc_d;       // re-read same word
+    else if (!valid_i || stall_d) fetch_pc = pc_d;       // re-read same word
     else if (redirect_id)         fetch_pc = target_id;
     else                          fetch_pc = pc_d + 32'd4;
   end
-  assign imem_addr = fetch_pc;
+  assign imem_addr   = fetch_pc;
+  assign imem_pc     = pc_d;
+  assign imem_lookup = valid_d && !halt_fetch;
+  assign imem_kill   = redirect_ex;
 
   // -------------------------------------------------------------------------
   // MEM: align load data
@@ -612,7 +651,7 @@ module rv_core #(
       valid_d <= 1'b1;
 
       // Return-address stack: update as the instruction leaves ID for EX
-      if (valid_d && !stall_d && !redirect_ex) begin
+      if (valid_i && !stall_d && !redirect_ex) begin
         if (ras_pop && ras_push) begin
           ras[ras_top] <= pc_d + 32'd4;          // pop then push = replace top
         end else if (ras_push) begin
@@ -625,8 +664,13 @@ module rv_core #(
 
       // ID -> EX
       if (ex_stall) begin
-        // EX is busy dividing: hold it (ID holds too, via stall_d)
-      end else if (redirect_ex || stall_d || !valid_d) begin
+        // EX is busy (dividing, or waiting on a data-cache miss): hold it, and
+        // ID holds too, via stall_d. Keep the operands current: the producers
+        // it's forwarding from move on and leave the pipeline while EX waits,
+        // after which the stale values read in ID would come back.
+        ex.rs1_val <= a_fwd;
+        ex.rs2_val <= b_fwd;
+      end else if (redirect_ex || stall_d || !valid_i) begin
         ex <= '0;  // bubble
       end else begin
         ex.valid   <= 1'b1;

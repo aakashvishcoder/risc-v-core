@@ -5,7 +5,8 @@
 #   make OBJ=obj_base EARLY_JAL=0           -> another configuration
 RTL_DIR = ../rtl
 RTL = $(RTL_DIR)/rv_alu.sv $(RTL_DIR)/rv_divider.sv $(RTL_DIR)/rv_regfile.sv $(RTL_DIR)/rv_core.sv \
-      $(RTL_DIR)/rv_ram.sv $(RTL_DIR)/uart_tx.sv $(RTL_DIR)/rv_soc.sv
+      $(RTL_DIR)/rv_ram.sv $(RTL_DIR)/rv_mainmem.sv $(RTL_DIR)/rv_icache.sv \
+      $(RTL_DIR)/uart_tx.sv $(RTL_DIR)/rv_soc.sv
 
 OBJ ?= obj_dir
 
@@ -17,8 +18,12 @@ GHR_BITS  ?= 8
 RAS_DEPTH ?= 8
 IBTB_BITS ?= 4
 M_EXT     ?= 2
+CACHES      ?= 0
+IC_LINES    ?= 64
+MEM_LATENCY ?= 20
 PARAMS = -GEARLY_JAL=$(EARLY_JAL) -GBPRED=$(BPRED) -GBHT_BITS=$(BHT_BITS) -GGHR_BITS=$(GHR_BITS) \
-         -GRAS_DEPTH=$(RAS_DEPTH) -GIBTB_BITS=$(IBTB_BITS) -GM_EXT=$(M_EXT)
+         -GRAS_DEPTH=$(RAS_DEPTH) -GIBTB_BITS=$(IBTB_BITS) -GM_EXT=$(M_EXT) \
+         -GCACHES=$(CACHES) -GIC_LINES=$(IC_LINES) -GMEM_LATENCY=$(MEM_LATENCY)
 VFLAGS = --cc --exe --build -j 0 -O3 --trace -Wall -Wno-fatal \
          -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM \
          -I$(RTL_DIR) +define+SIMULATION --top-module rv_soc \

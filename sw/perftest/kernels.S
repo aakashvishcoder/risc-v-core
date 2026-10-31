@@ -1,11 +1,12 @@
 # Kernels with exactly known performance-event counts.
 #
-# Each kernel is   void kN(uint32_t delta[10])
-# It snapshots cycle + hpmcounter3..11, runs a loop, snapshots again, and
-# writes the ten differences to delta[]:
+# Each kernel is   void kN(uint32_t delta[12])
+# It snapshots cycle + hpmcounter3..13, runs a loop, snapshots again, and
+# writes the twelve differences to delta[]:
 #   [0] cycles  [1] load-use stalls  [2] flush cycles  [3] branches
 #   [4] taken branches  [5] jumps  [6] branch mispredicts  [7] jump redirects
 #   [8] multiply-use stalls  [9] divider stall cycles
+#   [10] I-cache stall cycles  [11] D-cache stall cycles
 #
 # Snapshots read the counters in the same order at the start and the end, so
 # each counter is sampled the same distance from its own reads and the
@@ -24,29 +25,47 @@
     csrr s9, hpmcounter9
     csrr s10, hpmcounter10
     csrr s11, hpmcounter11
+    csrr s0, hpmcounter12
+    csrr s1, hpmcounter13
 .endm
 
-.macro DIFF1 csr, saved, off
-    csrr t0, \csr
-    sub  t0, t0, \saved
-    sw   t0, \off(a0)
+.macro DIFF1 now, saved, off
+    sub  \now, \now, \saved
+    sw   \now, \off(a0)
 .endm
 
+# Read every counter first, then subtract and store: with a slow memory, a
+# store between two counter reads would land in some counters' windows and
+# not others.
 .macro DIFF
-    DIFF1 cycle,       s2, 0
-    DIFF1 hpmcounter3, s3, 4
-    DIFF1 hpmcounter4, s4, 8
-    DIFF1 hpmcounter5, s5, 12
-    DIFF1 hpmcounter6, s6, 16
-    DIFF1 hpmcounter7, s7, 20
-    DIFF1 hpmcounter8, s8, 24
-    DIFF1 hpmcounter9, s9, 28
-    DIFF1 hpmcounter10, s10, 32
-    DIFF1 hpmcounter11, s11, 36
+    csrr t0, cycle
+    csrr t1, hpmcounter3
+    csrr t2, hpmcounter4
+    csrr t3, hpmcounter5
+    csrr t4, hpmcounter6
+    csrr t5, hpmcounter7
+    csrr t6, hpmcounter8
+    csrr a1, hpmcounter9
+    csrr a2, hpmcounter10
+    csrr a3, hpmcounter11
+    csrr a4, hpmcounter12
+    csrr a5, hpmcounter13
+    DIFF1 t0, s2, 0
+    DIFF1 t1, s3, 4
+    DIFF1 t2, s4, 8
+    DIFF1 t3, s5, 12
+    DIFF1 t4, s6, 16
+    DIFF1 t5, s7, 20
+    DIFF1 t6, s8, 24
+    DIFF1 a1, s9, 28
+    DIFF1 a2, s10, 32
+    DIFF1 a3, s11, 36
+    DIFF1 a4, s0, 40
+    DIFF1 a5, s1, 44
 .endm
 
 .macro PROLOGUE
-    addi sp, sp, -48
+    addi sp, sp, -64
     sw   s2, 0(sp)
     sw   s3, 4(sp)
     sw   s4, 8(sp)
@@ -58,6 +77,8 @@
     sw   s10, 32(sp)
     sw   s11, 36(sp)
     sw   ra, 40(sp)
+    sw   s0, 44(sp)
+    sw   s1, 48(sp)
 .endm
 
 .macro EPILOGUE
@@ -72,7 +93,9 @@
     lw   s10, 32(sp)
     lw   s11, 36(sp)
     lw   ra, 40(sp)
-    addi sp, sp, 48
+    lw   s0, 44(sp)
+    lw   s1, 48(sp)
+    addi sp, sp, 64
     ret
 .endm
 
