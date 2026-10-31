@@ -1,10 +1,11 @@
 # Kernels with exactly known performance-event counts.
 #
-# Each kernel is   void kN(uint32_t delta[8])
-# It snapshots cycle + hpmcounter3..9, runs a loop, snapshots again, and writes
-# the eight differences to delta[]:
+# Each kernel is   void kN(uint32_t delta[9])
+# It snapshots cycle + hpmcounter3..10, runs a loop, snapshots again, and
+# writes the nine differences to delta[]:
 #   [0] cycles  [1] load-use stalls  [2] flush cycles  [3] branches
 #   [4] taken branches  [5] jumps  [6] branch mispredicts  [7] jump redirects
+#   [8] multiply-use stalls
 #
 # Snapshots read the counters in the same order at the start and the end, so
 # each counter is sampled the same distance from its own reads and the
@@ -21,6 +22,7 @@
     csrr s7, hpmcounter7
     csrr s8, hpmcounter8
     csrr s9, hpmcounter9
+    csrr s10, hpmcounter10
 .endm
 
 .macro DIFF1 csr, saved, off
@@ -38,6 +40,7 @@
     DIFF1 hpmcounter7, s7, 20
     DIFF1 hpmcounter8, s8, 24
     DIFF1 hpmcounter9, s9, 28
+    DIFF1 hpmcounter10, s10, 32
 .endm
 
 .macro PROLOGUE
@@ -50,7 +53,8 @@
     sw   s7, 20(sp)
     sw   s8, 24(sp)
     sw   s9, 28(sp)
-    sw   ra, 32(sp)
+    sw   s10, 32(sp)
+    sw   ra, 36(sp)
 .endm
 
 .macro EPILOGUE
@@ -62,7 +66,8 @@
     lw   s7, 20(sp)
     lw   s8, 24(sp)
     lw   s9, 28(sp)
-    lw   ra, 32(sp)
+    lw   s10, 32(sp)
+    lw   ra, 36(sp)
     addi sp, sp, 48
     ret
 .endm
@@ -168,6 +173,23 @@ k7:
     addi t4, t4, 1
 2:  addi t3, t3, -1
     bnez t3, 1b
+    DIFF
+    EPILOGUE
+
+# k8: multiply immediately consumed, then a multiply with a gap (600
+# instructions). Encoded with .insn so this file assembles for any -march;
+# only called on a core with a multiplier.
+    .globl k8
+k8:
+    PROLOGUE
+    li   t3, N
+    SNAP
+1:  .insn r 0x33, 0, 1, t2, t3, t3    # mul  t2, t3, t3
+    add  t4, t2, t2                   # uses the product right away -> 1 stall
+    .insn r 0x33, 3, 1, t5, t3, t3    # mulhu t5, t3, t3
+    addi t3, t3, -1                   # independent filler
+    bnez t5, 2f                       # product now comes from WB: no stall
+2:  bnez t3, 1b
     DIFF
     EPILOGUE
 

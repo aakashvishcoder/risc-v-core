@@ -74,8 +74,9 @@ void *memset(void *dst, int c, size_t n) {
   return dst;
 }
 
-// ---- libgcc integer helpers (only used when the core lacks the M extension)
-#ifndef HAVE_M_EXT
+// ---- libgcc integer helpers, for whatever the hardware doesn't do.
+// HAVE_MUL / HAVE_DIV are set by sw/Makefile from MARCH.
+#ifndef HAVE_MUL
 uint32_t __mulsi3(uint32_t a, uint32_t b) {
   uint32_t r = 0;
   while (b) {
@@ -85,7 +86,9 @@ uint32_t __mulsi3(uint32_t a, uint32_t b) {
   }
   return r;
 }
+#endif
 
+#ifndef HAVE_DIV
 static uint32_t udivmod(uint32_t n, uint32_t d, uint32_t *rem) {
   if (d == 0) { *rem = n; return 0xFFFFFFFFu; }
   uint32_t q = 0, r = 0;

@@ -1,7 +1,9 @@
 #!/usr/bin/env bash
 # Run a program on the RTL and on the reference model, then diff the commit
 # traces and the UART output.
-#   tools/cosim.sh <prog.hex> [extra iss.py args, e.g. --m]
+#   tools/cosim.sh <prog.hex> [extra iss.py args]
+# The reference model always implements M: programs for a core without it are
+# simply built without M instructions.
 # A run passes only if the traces and UART output match AND the program reached
 # its exit with code 0 (two models agreeing on a hang or a crash is not a pass).
 # Env: SIM=<path to Vrv_soc> to use a different simulator build
@@ -16,7 +18,7 @@ MAX_CYCLES="${MAX_CYCLES:-50000000}"
 export PYTHONDONTWRITEBYTECODE=1
 
 "$SIM" +firmware="$HEX" +trace="$OUT/$NAME.rtl" +max_cycles="$MAX_CYCLES" > "$OUT/$NAME.rtl.uart" 2> "$OUT/$NAME.rtl.log" || true
-python3 "$ROOT/tools/iss.py" "$HEX" --trace "$OUT/$NAME.ref" --csr-sync "$OUT/$NAME.rtl" --max "$MAX_CYCLES" "$@" \
+python3 "$ROOT/tools/iss.py" "$HEX" --trace "$OUT/$NAME.ref" --csr-sync "$OUT/$NAME.rtl" --max "$MAX_CYCLES" --m "$@" \
   > "$OUT/$NAME.ref.uart" 2> "$OUT/$NAME.ref.log" || true
 
 printf '%-16s ' "$NAME"

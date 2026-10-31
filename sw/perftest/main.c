@@ -10,14 +10,15 @@
 // counters (destructive aliasing) and no useful bound exists, so misprediction
 // counts are only reported. Two identities are checked for every kernel:
 //   flush cycles = branch mispredictions + jump redirects
-//   cycles       = instructions + load-use stalls + flush cycles + constant
+//   cycles       = instructions + load-use + multiply-use stalls + flush cycles
+//                  + constant
 #include "rt.h"
 
 #define N 100
 
-enum { CYC, LU, FLUSH, BR, TAKEN, JUMPS, MISP, JREDIR, NEV };
-static const char *names[NEV] = {"cycles", "load-use", "flush", "branches",
-                                 "taken", "jumps", "mispredicts", "jump redirects"};
+enum { CYC, LU, FLUSH, BR, TAKEN, JUMPS, MISP, JREDIR, MU, NEV };
+static const char *names[NEV] = {"cycles", "load-use", "flush", "branches", "taken",
+                                 "jumps", "mispredicts", "jump redirects", "mul-use"};
 
 void k1(uint32_t d[NEV]);
 void k2(uint32_t d[NEV]);
@@ -26,9 +27,10 @@ void k4(uint32_t d[NEV]);
 void k5(uint32_t d[NEV]);
 void k6(uint32_t d[NEV]);
 void k7(uint32_t d[NEV]);
+void k8(uint32_t d[NEV]);
 
 // mconfig layout (see rv_core.sv)
-struct cfg { int early_jal, bpred, ras_depth, ibtb_bits, bht_bits, ghr_bits; };
+struct cfg { int early_jal, bpred, ras_depth, ibtb_bits, bht_bits, ghr_bits, m_ext; };
 enum { BP_NOT_TAKEN, BP_BTFN, BP_BIMODAL, BP_GSHARE };
 static const char *bp_names[] = {"not-taken", "BTFN", "bimodal", "gshare"};
 
@@ -36,7 +38,8 @@ static struct cfg read_cfg(void) {
   uint32_t v;
   __asm__ volatile("csrr %0, 0xFC0" : "=r"(v));
   struct cfg c = {(int)(v & 1), (int)((v >> 1) & 7), (int)((v >> 4) & 0xFF),
-                  (int)((v >> 12) & 0xF), (int)((v >> 16) & 0xF), (int)((v >> 20) & 0xF)};
+                  (int)((v >> 12) & 0xF), (int)((v >> 16) & 0xF), (int)((v >> 20) & 0xF),
+                  (int)((v >> 24) & 0x3)};
   return c;
 }
 
@@ -101,41 +104,45 @@ struct test {
   const char *name;
   void (*fn)(uint32_t *);
   uint32_t insns;
-  uint32_t lu, br, taken, jumps;     // exact
+  uint32_t lu, br, taken, jumps, mu; // exact
   struct range misp, jredir;         // configuration dependent
 };
 
 int main(void) {
   struct cfg c = read_cfg();
-  printf_("perftest: early_jal=%d bpred=%s bht_bits=%d ghr_bits=%d ras=%d ibtb_bits=%d\n",
+  printf_("perftest: early_jal=%d bpred=%s bht_bits=%d ghr_bits=%d ras=%d ibtb_bits=%d m_ext=%d\n",
           c.early_jal, c.bpred < 4 ? bp_names[c.bpred] : "?", c.bht_bits, c.ghr_bits,
-          c.ras_depth, c.ibtb_bits);
+          c.ras_depth, c.ibtb_bits, c.m_ext);
   if (aliasing(&c))
     printf_("  (tables under %d index bits alias: mispredicts reported, not bounded)\n",
             MIN_BHT_BITS);
 
   struct range none = EXACT(0);
   const struct test tests[] = {
-    {"k1 load-use",         k1, 4 * N,          N,     N,     N - 1,           0,     loop_misp(&c), none},
-    {"k2 load + gap",       k2, 4 * N,          0,     N,     N - 1,           0,     loop_misp(&c), none},
-    {"k3 rs2 / store data", k3, 6 * N,          2 * N, N,     N - 1,           0,     loop_misp(&c), none},
-    {"k4 call / return",    k4, 5 * N,          0,     N,     N - 1,           2 * N, loop_misp(&c), call_ret_redirects(&c)},
-    {"k5 load to x0",       k5, 4 * N,          0,     N,     N - 1,           0,     loop_misp(&c), none},
-    {"k6 never taken",      k6, 4 * N,          0,     2 * N, N - 1,           0,     radd(loop_misp(&c), never_misp(&c)), none},
-    {"k7 alternating",      k7, 5 * N - N / 2,  0,     2 * N, N - 1 + N / 2,   0,     radd(loop_misp(&c), alt_misp(&c)), none},
+    {"k1 load-use",         k1, 4 * N,          N,     N,     N - 1,           0, 0,     loop_misp(&c), none},
+    {"k2 load + gap",       k2, 4 * N,          0,     N,     N - 1,           0, 0,     loop_misp(&c), none},
+    {"k3 rs2 / store data", k3, 6 * N,          2 * N, N,     N - 1,           0, 0,     loop_misp(&c), none},
+    {"k4 call / return",    k4, 5 * N,          0,     N,     N - 1,           2 * N, 0, loop_misp(&c), call_ret_redirects(&c)},
+    {"k5 load to x0",       k5, 4 * N,          0,     N,     N - 1,           0, 0,     loop_misp(&c), none},
+    {"k6 never taken",      k6, 4 * N,          0,     2 * N, N - 1,           0, 0,     radd(loop_misp(&c), never_misp(&c)), none},
+    {"k7 alternating",      k7, 5 * N - N / 2,  0,     2 * N, N - 1 + N / 2,   0, 0,     radd(loop_misp(&c), alt_misp(&c)), none},
+    // two multiplies per iteration, the first one consumed immediately
+    {"k8 multiply-use",     k8, 6 * N,          0,     2 * N, N - 1,           0, N,  radd(loop_misp(&c), never_misp(&c)), none},
   };
+  unsigned ntests = sizeof tests / sizeof tests[0];
+  if (c.m_ext < 1) ntests--;            // k8 needs a multiplier
 
   int fails = 0;
   int32_t slack0 = 0;
-  for (unsigned t = 0; t < sizeof tests / sizeof tests[0]; t++) {
+  for (unsigned t = 0; t < ntests; t++) {
     const struct test *T = &tests[t];
     uint32_t d[NEV];
     T->fn(d);
     int ok = 1;
 
-    uint32_t exact[NEV] = {0, T->lu, 0, T->br, T->taken, T->jumps, 0, 0};
-    for (int k = LU; k <= JUMPS; k++) {
-      if (k == FLUSH) continue;
+    uint32_t exact[NEV] = {0, T->lu, 0, T->br, T->taken, T->jumps, 0, 0, T->mu};
+    for (int k = LU; k < NEV; k++) {
+      if (k == FLUSH || k == MISP || k == JREDIR) continue;
       if (d[k] != exact[k]) {
         printf_("  FAIL %s: %s = %u, expected %u\n", T->name, names[k], d[k], exact[k]);
         ok = 0;
@@ -157,10 +164,10 @@ int main(void) {
       ok = 0;
     }
     // Cycle accounting: the snapshot code adds the same constant to every kernel
-    int32_t slack = (int32_t)(d[CYC] - (T->insns + d[LU] + d[FLUSH]));
+    int32_t slack = (int32_t)(d[CYC] - (T->insns + d[LU] + d[MU] + d[FLUSH]));
     if (t == 0) slack0 = slack;
-    printf_("  %-20s cycles=%u = %u insns + %u load-use + %u flush (%u mispredict + %u jump) + %d\n",
-            T->name, d[CYC], T->insns, d[LU], d[FLUSH], d[MISP], d[JREDIR], slack);
+    printf_("  %-20s cycles=%u = %u insns + %u load-use + %u mul-use + %u flush (%u mispredict + %u jump) + %d\n",
+            T->name, d[CYC], T->insns, d[LU], d[MU], d[FLUSH], d[MISP], d[JREDIR], slack);
     if (slack != slack0 || slack < 0 || slack > 16) {
       printf_("  FAIL %s: cycle accounting constant %d differs (expected %d)\n", T->name,
               slack, slack0);

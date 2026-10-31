@@ -36,8 +36,8 @@ volatile ee_s32 seed5_volatile = 0;
 
 #define CSRR(name) ({ ee_u32 v_; __asm__ volatile("csrr %0, " #name : "=r"(v_)); v_; })
 
-/* cycle, instret, hpmcounter3..9 */
-#define NCTR 9
+/* cycle, instret, hpmcounter3..10 */
+#define NCTR 10
 static ee_u32 t_start[NCTR], t_stop[NCTR];
 
 static void snapshot(ee_u32 *s) {
@@ -50,6 +50,7 @@ static void snapshot(ee_u32 *s) {
   s[6] = CSRR(hpmcounter7);
   s[7] = CSRR(hpmcounter8);
   s[8] = CSRR(hpmcounter9);
+  s[9] = CSRR(hpmcounter10);
 }
 
 void start_time(void) { snapshot(t_start); }
@@ -87,7 +88,7 @@ void portable_fini(core_portable *p) {
   ee_u32 d[NCTR];
   for (int i = 0; i < NCTR; i++) d[i] = t_stop[i] - t_start[i];
   ee_u32 cycles = d[0], insns = d[1];
-  ee_u32 other = cycles - insns - d[2] - d[3];
+  ee_u32 other = cycles - insns - d[2] - d[9] - d[3];
 
   ee_printf("\nrisc-v-core: %u iterations, %u cycles, %u instructions\n",
             (unsigned)ITERATIONS, (unsigned)cycles, (unsigned)insns);
@@ -96,6 +97,7 @@ void portable_fini(core_portable *p) {
   ee_printf("CPI stack (share of cycles):\n");
   print_pct("retiring             ", insns, cycles);
   print_pct("load-use stalls      ", d[2], cycles);
+  print_pct("multiply-use stalls  ", d[9], cycles);
   print_pct("branch/jump flushes  ", d[3], cycles);
   print_pct("other                ", other, cycles);
   ee_printf("Control flow:\n");

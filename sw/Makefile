@@ -1,9 +1,9 @@
 # Build RV32I programs with clang + ld.lld.
 #   make PROG=hello          -> build/hello.{elf,bin,hex,dis}
 #   make PROG=coremark ITERATIONS=10
-#   make PROG=bench MARCH=rv32im_zicsr CFLAGS_EXTRA=-DHAVE_M_EXT
+#   make PROG=hello MARCH=rv32i_zicsr      -> for a core without multiply
 PROG   ?= hello
-MARCH  ?= rv32i_zicsr
+MARCH  ?= rv32i_zmmul_zicsr
 OPT    ?= -O2
 BUILD  ?= build
 
@@ -12,6 +12,14 @@ ITERATIONS ?= 10
 ifeq ($(PROG),coremark)
 CFLAGS_EXTRA += -DITERATIONS=$(ITERATIONS) -DFLAGS_STR='"$(OPT) $(MARCH)"' \
                 -Wno-implicit-function-declaration
+endif
+
+# Tell the runtime which libgcc helpers the hardware makes unnecessary
+ifneq ($(findstring zmmul,$(MARCH))$(findstring im,$(MARCH)),)
+CFLAGS_EXTRA += -DHAVE_MUL
+endif
+ifneq ($(findstring im,$(MARCH)),)
+CFLAGS_EXTRA += -DHAVE_DIV
 endif
 
 CC      = clang

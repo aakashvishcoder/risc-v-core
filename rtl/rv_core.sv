@@ -31,7 +31,8 @@ module rv_core #(
   parameter int          BHT_BITS  = 8,       // log2(branch history table entries)
   parameter int          GHR_BITS  = 8,       // gshare global history length
   parameter int          RAS_DEPTH = 8,       // return-address stack entries (0 = none)
-  parameter int          IBTB_BITS = 4        // log2(indirect jump target buffer entries), 0 = none
+  parameter int          IBTB_BITS = 4,       // log2(indirect jump target buffer entries), 0 = none
+  parameter int          M_EXT     = 1        // 0 none, 1 Zmmul (multiply only)
 ) (
   input  logic        clk,
   input  logic        rst,
@@ -73,6 +74,7 @@ module rv_core #(
     logic       is_jalr;
     logic       is_load;
     logic       is_store;
+    logic       is_mul;
     logic [1:0] wb_sel;
     logic       trap;
   } ctrl_t;
@@ -102,9 +104,12 @@ module rv_core #(
     logic [4:0]  rd;
     logic        reg_we;
     logic        is_load;
+    logic        is_mul;
     logic [2:0]  funct3;
     logic [1:0]  addr_lo;
     logic [31:0] result;
+    logic [32:0] mul_a;    // sign/zero-extended multiplier operands
+    logic [32:0] mul_b;
     logic        trap;
   } exmem_t;
 
@@ -191,8 +196,14 @@ module rv_core #(
       OP_REG: begin
         c_d.reg_we = 1; c_d.uses_rs1 = 1; c_d.uses_rs2 = 1;
         c_d.alu_op = {instr_d[30], f3_d};
-        c_d.trap = !((f7_d == 7'b0) ||
-                     (f7_d == 7'b0100000 && (f3_d == 3'b000 || f3_d == 3'b101)));
+        if (f7_d == 7'b0000001) begin
+          // M extension: MUL/MULH/MULHSU/MULHU (funct3 0-3)
+          c_d.is_mul = (M_EXT >= 1) && !f3_d[2];
+          c_d.trap   = !c_d.is_mul;
+        end else begin
+          c_d.trap = !((f7_d == 7'b0) ||
+                       (f7_d == 7'b0100000 && (f3_d == 3'b000 || f3_d == 3'b101)));
+        end
       end
       OP_FENCE: ; // no caches or reordering: NOP
       OP_SYSTEM: begin
@@ -220,18 +231,23 @@ module rv_core #(
     .wd  (wb.value)
   );
 
-  // Load-use hazard: EX holds a load whose result the ID instruction needs.
-  // The load's data only exists at the end of MEM, so forwarding can't help.
-  wire load_use = ex.valid && ex.c.is_load && (ex.rd != 5'd0) &&
+  // Late-result hazard: EX holds a load or a multiply whose result the ID
+  // instruction needs. Both produce their result at the end of MEM (load data
+  // from the RAM, the product from the MEM-stage multiplier), so forwarding
+  // can't help and ID stalls one cycle.
+  wire ex_dep   = (ex.rd != 5'd0) &&
                   ((c_d.uses_rs1 && rs1_d == ex.rd) || (c_d.uses_rs2 && rs2_d == ex.rd));
+  wire load_use = ex.valid && ex.c.is_load && ex_dep;
+  wire mul_use  = ex.valid && ex.c.is_mul  && ex_dep;
 
   // -------------------------------------------------------------------------
   // EX
   // -------------------------------------------------------------------------
-  // Forwarding: youngest producer wins (MEM before WB). A load in MEM can't
-  // forward (its data isn't ready until the end of MEM) - load_use covers it.
+  // Forwarding: youngest producer wins (MEM before WB). A load or multiply in
+  // MEM can't forward (its result isn't ready until the end of MEM) - the
+  // late-result stall covers it.
   function automatic logic [31:0] fwd(input logic [4:0] r, input logic [31:0] v);
-    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && mem.rd == r)
+    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)
       return mem.result;
     if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)
       return wb.value;
@@ -310,10 +326,11 @@ module rv_core #(
   //   8  branch mispredictions     (redirects caused by a conditional branch)
   //   9  jump redirects from EX    (jumps not followed in decode, or followed
   //                                 to the wrong target)
+  //  10  multiply-use stall cycles ID held because EX has a multiply it depends on
   // Every flush is one or the other, so event 4 == event 8 + event 9, and
-  //   cycles = instret + load-use stalls + flush cycles + pipeline fill.
+  //   cycles = instret + load-use + multiply-use stalls + flush cycles + fill.
   // -------------------------------------------------------------------------
-  localparam int NHPM = 7;               // hpmcounter3 .. hpmcounter9
+  localparam int NHPM = 8;               // hpmcounter3 .. hpmcounter10
   logic [NHPM-1:0] perf_ev;
   logic [63:0]     hpm [NHPM];
 
@@ -324,6 +341,7 @@ module rv_core #(
   assign perf_ev[4] = ex.valid && (ex.c.is_jal || ex.c.is_jalr);
   assign perf_ev[5] = br_mispredict;
   assign perf_ev[6] = jmp_redirect;
+  assign perf_ev[7] = valid_d && mul_use && !redirect_ex && !halt_fetch;
 
   // Read-only configuration register in the custom machine CSR space, so
   // software (tests, benchmarks) can tell which features this build has.
@@ -333,9 +351,10 @@ module rv_core #(
   //   [15:12] log2(indirect jump target buffer entries) (0 = none)
   //   [19:16] log2(branch history table entries)
   //   [23:20] gshare global history length
+  //   [25:24] M extension: 0 none, 1 Zmmul (multiply only)
   localparam logic [11:0] CSR_MCONFIG = 12'hFC0;
-  wire [31:0] mconfig = {8'b0, 4'(GHR_BITS), 4'(BHT_BITS), 4'(IBTB_BITS), 8'(RAS_DEPTH),
-                         3'(BPRED), EARLY_JAL};
+  wire [31:0] mconfig = {6'b0, 2'(M_EXT), 4'(GHR_BITS), 4'(BHT_BITS), 4'(IBTB_BITS),
+                         8'(RAS_DEPTH), 3'(BPRED), EARLY_JAL};
 
   // CSR reads (read-only counters)
   logic [31:0] csr_val;
@@ -366,6 +385,15 @@ module rv_core #(
       default: ex_result = alu_y;
     endcase
   end
+
+  // Multiplier operands, sign- or zero-extended to 33 bits so one signed
+  // 33x33 multiply covers all four variants:
+  //   MUL / MULHU: unsigned x unsigned   MULH: signed x signed
+  //   MULHSU:      signed x unsigned
+  wire a_signed = (f3_e[1:0] == 2'b01) || (f3_e[1:0] == 2'b10);   // MULH, MULHSU
+  wire b_signed = (f3_e[1:0] == 2'b01);                           // MULH
+  wire [32:0] mul_a_e = {a_signed & a_fwd[31], a_fwd};
+  wire [32:0] mul_b_e = {b_signed & b_fwd[31], b_fwd};
 
   // Data memory request (address = ALU result for loads/stores)
   wire [1:0] byte_off = alu_y[1:0];
@@ -484,7 +512,7 @@ module rv_core #(
   wire [31:0] target_id   = jalr_pred_d ? jalr_target_d
                                         : pc_d + (c_d.is_jal ? imm_j : imm_b);
 
-  wire stall_d = load_use || halt_fetch;
+  wire stall_d = load_use || mul_use || halt_fetch;
   logic [31:0] fetch_pc;
   always_comb begin
     if (redirect_ex)              fetch_pc = target_ex;  // EX outranks ID: ID may be wrong-path
@@ -508,7 +536,14 @@ module rv_core #(
       default: load_val = dmem_rdata;
     endcase
   end
-  wire [31:0] mem_value = mem.is_load ? load_val : mem.result;
+  // MEM-stage multiply. The operands come straight from the EX/MEM register
+  // and the result goes straight into MEM/WB, which matches a DSP48 with
+  // input and output registers. MUL takes the low word, MULH* the high word.
+  wire signed [65:0] product = $signed(mem.mul_a) * $signed(mem.mul_b);
+  wire [31:0]        mul_val = (mem.funct3[1:0] == 2'b00) ? product[31:0] : product[63:32];
+
+  wire [31:0] mem_value = mem.is_load ? load_val :
+                          mem.is_mul  ? mul_val  : mem.result;
 
   // -------------------------------------------------------------------------
   // Pipeline registers
@@ -577,6 +612,9 @@ module rv_core #(
       mem.rd      <= ex.rd;
       mem.reg_we  <= ex.valid && ex.c.reg_we;
       mem.is_load <= ex.valid && ex.c.is_load;
+      mem.is_mul  <= ex.valid && ex.c.is_mul;
+      mem.mul_a   <= mul_a_e;
+      mem.mul_b   <= mul_b_e;
       mem.funct3  <= f3_e;
       mem.addr_lo <= byte_off;
       mem.result  <= ex_result;
