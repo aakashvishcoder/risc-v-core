@@ -18,8 +18,14 @@ scheme below assumes taken predictions redirect from ID at no cost.
 
 The model is calibrated against the real run: the RTL testbench log next to
 the trace (<trace>.log) gives the measured cycle count, from which the
-load-use stall cycles are recovered, so the "current core" row reproduces the
-measured CPI and the other rows are what-if estimates on the same run.
+load-use stall cycles are recovered, so the baseline row reproduces the
+measured CPI and the other rows are what-if estimates on the same run. The
+trace must come from the baseline configuration (no prediction, JAL in EX),
+which `make study` builds.
+
+Jump models: a return-address stack (same push/pop rules as the RTL) and an
+indirect jump target buffer (direct-mapped by pc, remembers each JALR's last
+target) for JALRs the stack doesn't predict.
 
     bpred_study.py out/coremark_1iter.rtl
 """
@@ -67,6 +73,36 @@ class Gshare(Bimodal):
         self.h = ((self.h << 1) | taken) & ((1 << self.hb) - 1)
 
 
+def jalr_misses(jumps, ras_depth, ibtb_bits):
+    """Count JALRs whose target isn't correctly predicted."""
+    ras, top = [0] * max(1, ras_depth), 0
+    ibtb = {}
+    miss = 0
+    link = (1, 5)
+    for kind, pc, rd, rs1, target in jumps:
+        pop = ras_depth and kind == "jalr" and rs1 in link and not (rd in link and rd == rs1)
+        push = ras_depth and rd in link
+        if kind == "jalr":
+            if pop:
+                pred = ras[top]
+            elif ibtb_bits:
+                e = ibtb.get((pc >> 2) & ((1 << ibtb_bits) - 1))
+                pred = e[1] if e and e[0] == pc else None
+            else:
+                pred = None
+            miss += pred != target
+            if ibtb_bits and not pop:
+                ibtb[(pc >> 2) & ((1 << ibtb_bits) - 1)] = (pc, target)
+        if pop and push:
+            ras[top] = pc + 4
+        elif push:
+            top = (top + 1) % ras_depth
+            ras[top] = pc + 4
+        elif pop:
+            top = (top - 1) % ras_depth
+    return miss
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("trace")
@@ -74,18 +110,21 @@ def main():
 
     insns = 0
     branches = []          # (pc, taken, backward)
+    jumps = []             # (kind, pc, rd, rs1, target)
     jal = jalr = ret = jalr_call = 0
     prev = 0
     for pc, ins, npc in parse(args.trace):
         insns += 1
         op = ins & 0x7F
+        rs1, rd = (ins >> 15) & 31, (ins >> 7) & 31
         if op == 0x63:
             branches.append((pc, npc != pc + 4, b_imm(ins) < 0))
         elif op == 0x6F:
             jal += 1
+            jumps.append(("jal", pc, rd, 0, npc))
         elif op == 0x67:
             jalr += 1
-            rs1, rd = (ins >> 15) & 31, (ins >> 7) & 31
+            jumps.append(("jalr", pc, rd, rs1, npc))
             if rs1 == 1 and rd == 0:                    # ret = jalr x0, 0(ra)
                 ret += 1
             elif rd == 1 and (prev & 0x7F) == 0x17:     # call = auipc ra + jalr ra
@@ -122,8 +161,9 @@ def main():
             pred.update(pc, t)
         return miss
 
+    gshare = dynamic(Gshare(8, 8))
     schemes = [
-        ("predict not-taken, all jumps in EX  (current core)", static(lambda b: False), jal + jalr),
+        ("predict not-taken, all jumps in EX  (baseline)",     static(lambda b: False), jal + jalr),
         ("predict not-taken, JAL in ID",                         static(lambda b: False), jalr),
         ("static BTFN (backward taken), JAL in ID",              static(lambda b: b), jalr),
         ("bimodal 2-bit, 64 entries, JAL in ID",                 dynamic(Bimodal(6)), jalr),
@@ -131,7 +171,9 @@ def main():
         ("bimodal 2-bit, 1024 entries, JAL in ID",               dynamic(Bimodal(10)), jalr),
         ("gshare, 256 entries, 8-bit history, JAL in ID",        dynamic(Gshare(8, 8)), jalr),
         ("gshare, 1024 entries, 10-bit history, JAL in ID",      dynamic(Gshare(10, 10)), jalr),
-        ("bimodal 256 + perfect return prediction",              dynamic(Bimodal(8)), jalr - ret),
+        ("gshare 256 + return-address stack (8)",                gshare, jalr_misses(jumps, 8, 0)),
+        ("gshare 256 + RAS 8 + indirect target buffer (16)",     gshare, jalr_misses(jumps, 8, 4)),
+        ("gshare 256 + RAS 8 + indirect target buffer (64)",     gshare, jalr_misses(jumps, 8, 6)),
         ("perfect prediction (upper bound)",                     0, 0),
     ]
     FILL = 4                      # pipeline fill + exit drain in the testbench
