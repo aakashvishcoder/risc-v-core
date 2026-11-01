@@ -1,6 +1,6 @@
 # risc-v-core
 
-A 5-stage pipelined RISC-V (RV32IM + Zicsr) processor written in
+A 5-stage pipelined RISC-V (RV32IM + Zicsr + Zifencei) processor written in
 SystemVerilog, with gshare branch prediction, a return-address stack, an
 indirect jump target buffer, a hardware multiplier and divider, optional
 instruction and write-back data caches in front of a slow main memory, and
@@ -51,8 +51,8 @@ sched: all tasks done after 429 context switches
 - [x] M extension: pipelined multiplier, iterative divider
 - [x] Instruction cache and 2-way write-back data cache in front of a slow main memory
 - [x] Precise machine-mode exceptions, full CSR file, CLINT timer/software/external interrupts
-- [x] FPGA synthesis, place and route for the XC7A35T (open-source flow): 62 MHz, 22% of the LUTs
-- [ ] Official RISC-V architecture compliance tests
+- [x] FPGA synthesis, place and route for the XC7A35T (open-source flow): 60 MHz, 22% of the LUTs
+- [x] Official RISC-V architecture tests (riscv-arch-test): 63/63 pass, single-cycle RAM and caches
 - [ ] FPGA bring-up on the carrier board
 
 ## Layout
@@ -74,6 +74,7 @@ make -C sim                                # build the simulator
 make -C sim run HEX=../sw/build/hello.hex  # run it
 make test                                  # full test suite
 make demo                                  # preemptive scheduler demo
+make compliance                            # official RISC-V architecture tests
 fpga/build.sh                              # synthesize, place and route for the XC7A35T
 make bench                                 # CoreMark with a CPI breakdown
 make study                                 # branch predictor what-if study
@@ -122,6 +123,7 @@ memstream        MATCH: 162538 instructions | uart ok | exit  code=0  cycles=168
 traptest         MATCH: 60193 instructions, 32 traps | uart ok | exit  code=0  cycles=68914 ...
 irqtest          MATCH: 171479 instructions, 1270 traps | uart ok | exit  code=0  cycles=322911 ...
 sched            MATCH: 923696 instructions, 430 traps | uart ok | exit  code=0  cycles=2565064 ...
+fencei           MATCH: 1293 instructions | uart ok | exit  code=0  cycles=1545 ...
 coremark_1iter   MATCH: 411140 instructions | uart ok | exit  code=0  cycles=472013 ...
 == directed programs, caches + slow main memory
 hello            MATCH: 791 instructions | uart ok | exit  code=0  cycles=2251 ...
@@ -133,6 +135,7 @@ memstream        MATCH: 162808 instructions | uart ok | exit  code=0  cycles=561
 traptest         MATCH: 60193 instructions, 32 traps | uart ok | exit  code=0  cycles=96371 ...
 irqtest          MATCH: 256679 instructions, 2527 traps | uart ok | exit  code=0  cycles=599007 ...
 sched            MATCH: 934735 instructions, 501 traps | uart ok | exit  code=0  cycles=2949759 ...
+fencei           MATCH: 1293 instructions | uart ok | exit  code=0  cycles=13249 ...
 coremark_1iter   MATCH: 414017 instructions | uart ok | exit  code=0  cycles=548017 ...
 == random programs, single-cycle RAM
 random tests: 100 passed, 0 failed
@@ -209,6 +212,37 @@ misaligned jump and branch targets, self-inflicted software and external
 interrupts, toggling of `mstatus.MIE`/`mie`, and reads of
 `mcause`/`mepc`/`mtval`/`mip` into the hot registers. That comes to about
 60 traps of every kind per program, on top of all the pipeline hazards.
+
+**Official architecture tests.** `make compliance` runs the RISC-V
+International architecture test suite
+([riscv-arch-test](https://github.com/riscv-non-isa/riscv-arch-test), tag
+2.7.4): every RV32I, M, Zifencei and machine-mode privilege test that
+applies to this core, 63 in all. Each test writes a signature of the
+results it computed. `compliance/run.py` compares that signature word for
+word with the reference signature shipped with the suite, which comes
+from the suite's own reference simulator, not from anything in this
+repository. It also co-simulates every test against the reference model.
+
+```
+compliance: 63/63 tests passed (55 against the reference signature, 8 co-simulated only)
+```
+
+The suite runs twice, on single-cycle RAM and on the cached memory system.
+The jump and branch tests are up to 2 MB of code, so those builds use 4 MB
+of RAM. Eight privilege tests (misaligned jump and branch targets) only
+co-simulate. In 2.7.4 their single reference signature was generated for a
+core with compressed instructions, where jumping to `pc + 2` is legal.
+Without C, the same jump has to trap, so this core rightly produces a
+different signature for them.
+
+**Self-modifying code.** FENCE.I (Zifencei) makes instruction fetch see
+every earlier store. On single-cycle RAM there's nothing to do: fetch and
+data share one memory. With caches, FENCE.I holds EX while the data cache
+walks its lines and writes back the dirty ones. It then invalidates the
+instruction cache and refetches everything after itself. `sw/fencei`
+rewrites a function in RAM and calls it again 32 times, and rewrites the
+very next instruction after a store 8 times. That instruction has already
+been fetched, so it only runs correctly if FENCE.I throws it away.
 
 **Every configuration.** `make test-configs` builds sixteen configurations,
 from the baseline pipeline up to full prediction with RV32IM, plus five
@@ -299,8 +333,14 @@ the scheduler demo fails:
 | Vectored mode ignored | **0** | fail |
 | `mcountinhibit` doesn't stop `mcycle` | **0** | fail |
 | Timer interrupt only on `mtime == mtimecmp` | **0** | fail |
+| FENCE.I doesn't write back the data cache ¹ | **0** | fail |
+| FENCE.I doesn't invalidate the instruction cache ¹ | **0** | fail |
+| FENCE.I doesn't refetch the instructions after it | **0** | fail |
 
-59/59 killed. The rows marked **0** in the random columns keep every result
+¹ Built with caches (single-cycle RAM has nothing to flush). "Directed"
+here includes `sw/fencei`.
+
+62/62 killed. The rows marked **0** in the random columns keep every result
 correct, or never come up in random code, so co-simulation alone can't find
 them; only the counter, cache and directed trap tests can.
 
@@ -643,9 +683,9 @@ placement, routing and timing analysis, with no Vivado.
 
 | Resource | Used | XC7A35T | |
 |---|---|---|---|
-| LUTs (logic) | 4,442 | 20,800 | 21% |
+| LUTs (logic) | 4,436 | 20,800 | 21% |
 | LUTs as distributed RAM | 152 | | register file, predictor tables |
-| Flip-flops | 2,027 | 41,600 | 5% |
+| Flip-flops | 2,028 | 41,600 | 5% |
 | Block RAM (RAMB36) | 16 | 50 | 64 KB of program/data memory |
 | DSP48 | 4 | 90 | the 33×33 multiplier |
 
@@ -655,9 +695,10 @@ The core itself is about 3,500 LUTs. The divider adds 240 and the CLINT
 **Timing.** The board's oscillator is 50 MHz. The first routed build
 reached only **36 MHz** (median of 5 placement seeds). Each critical path
 report showed one long chain of logic, and fixing them one at a time took
-it to **62 MHz** (median; 48-66 MHz across seeds), 1.7× faster. None of
+it to **60 MHz** (median; 59-62 MHz across seeds, all above the board's
+50 MHz), 1.7× faster. None of
 the fixes costs a single cycle: CPI and CoreMark/MHz are unchanged, and
-every test and all 59 mutants pass.
+every test passes and every mutant is still caught.
 
 1. **Counter increments were in the same cycle as the trap decision.**
    Every event (a branch, a stall, a trap) is decided late in EX and was
