@@ -36,23 +36,17 @@ CACHED = "CACHES=1"   # build setting for memory-system mutants
 # (name, file, original text, mutated text[, build settings])
 MUTANTS = [
     ("no MEM->EX forwarding", "rv_core.sv",
-     "if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)",
-     "if (1'b0)"),
+     "wire [31:0] a_fwd = ex.fwd1_mem ? mem.result : ex.fwd1_wb ? wb.value : ex.rs1_val;\n  wire [31:0] b_fwd = ex.fwd2_mem ? mem.result : ex.fwd2_wb ? wb.value : ex.rs2_val;",
+     "wire [31:0] a_fwd = ex.fwd1_wb ? wb.value : ex.rs1_val;\n  wire [31:0] b_fwd = ex.fwd2_wb ? wb.value : ex.rs2_val;"),
     ("no WB->EX forwarding", "rv_core.sv",
-     "if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)",
-     "if (1'b0)"),
+     "wire [31:0] a_fwd = ex.fwd1_mem ? mem.result : ex.fwd1_wb ? wb.value : ex.rs1_val;\n  wire [31:0] b_fwd = ex.fwd2_mem ? mem.result : ex.fwd2_wb ? wb.value : ex.rs2_val;",
+     "wire [31:0] a_fwd = ex.fwd1_mem ? mem.result : ex.rs1_val;\n  wire [31:0] b_fwd = ex.fwd2_mem ? mem.result : ex.rs2_val;"),
     ("forwarding priority reversed (WB before MEM)", "rv_core.sv",
-     """    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)
-      return mem.result;
-    if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)
-      return wb.value;""",
-     """    if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)
-      return wb.value;
-    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)
-      return mem.result;"""),
+     "wire [31:0] a_fwd = ex.fwd1_mem ? mem.result : ex.fwd1_wb ? wb.value : ex.rs1_val;\n  wire [31:0] b_fwd = ex.fwd2_mem ? mem.result : ex.fwd2_wb ? wb.value : ex.rs2_val;",
+     "wire [31:0] a_fwd = ex.fwd1_wb ? wb.value : ex.fwd1_mem ? mem.result : ex.rs1_val;\n  wire [31:0] b_fwd = ex.fwd2_wb ? wb.value : ex.fwd2_mem ? mem.result : ex.rs2_val;"),
     ("forwarding from x0", "rv_core.sv",
-     "if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)",
-     "if (wb.valid && wb.reg_we && wb.rd == r)"),
+     "return r != 5'd0 && mem.valid && mem.reg_we && mem.rd == r;",
+     "return mem.valid && mem.reg_we && mem.rd == r;"),
     ("no load-use stall", "rv_core.sv",
      "wire load_use = ex.valid && ex.c.is_load",
      "wire load_use = 1'b0 && ex.valid && ex.c.is_load"),
@@ -172,8 +166,12 @@ MUTANTS = [
      "wire        valid_i = valid_d && !fetch_miss;",
      "wire        valid_i = valid_d;", CACHED),
     ("EX operands not refreshed during a stall", "rv_core.sv",
-     """        ex.rs1_val <= a_fwd;
-        ex.rs2_val <= b_fwd;""",
+     """        ex.rs1_val  <= a_fwd;
+        ex.rs2_val  <= b_fwd;
+        ex.fwd1_mem <= 1'b0;
+        ex.fwd1_wb  <= 1'b0;
+        ex.fwd2_mem <= 1'b0;
+        ex.fwd2_wb  <= 1'b0;""",
      "", CACHED),
     # --- caches: performance only ---
     ("D-cache LRU never updated", "rv_dcache.sv",
@@ -181,8 +179,8 @@ MUTANTS = [
      "", CACHED),
     # --- traps and interrupts ---
     ("faulting store still writes memory", "rv_core.sv",
-     "if (ex_live && ex.c.is_store) begin",
-     "if (ex.valid && ex.c.is_store) begin"),
+     "    if (ls_live && ex.c.is_store) begin",
+     "    if (ex.valid && ex.c.is_store) begin"),
     ("trapped instruction still retires", "rv_core.sv",
      "mem.valid   <= ex_live && !ex_stall;",
      "mem.valid   <= ex.valid && !ex_stall;"),
@@ -215,17 +213,17 @@ MUTANTS = [
      "                         jump_target[1];",
      "                         1'b0;"),
     ("no access faults for loads/stores", "rv_core.sv",
-     "wire ls_mapped     = (ls_addr < 32'(RAM_BYTES)) ||",
-     "wire ls_mapped     = 1'b1 || (ls_addr < 32'(RAM_BYTES)) ||"),
+     "wire ls_mapped     = (ls_addr[31:RAM_BITS] == '0) ||",
+     "wire ls_mapped     = 1'b1 || (ls_addr[31:RAM_BITS] == '0) ||"),
     ("no fetch access faults", "rv_core.sv",
-     "wire        fetch_fault = (pc_d >= 32'(RAM_BYTES));",
+     "wire        fetch_fault = (pc_d[31:RAM_BITS] != '0);",
      "wire        fetch_fault = 1'b0;"),
     ("illegal-instruction mtval holds the pc", "rv_core.sv",
      "begin exc_cause = 32'd2;  exc_tval = ex.instr; end",
      "begin exc_cause = 32'd2;  exc_tval = ex.pc; end"),
     ("writes to read-only CSRs allowed", "rv_core.sv",
-     "(!csr_known || (csr_writes && csr_addr[11:10] == 2'b11))",
-     "(!csr_known)"),
+     "return known && !(writes && n[11:10] == 2'b11);",
+     "return known;"),
     ("mcountinhibit doesn't stop mcycle", "rv_core.sv",
      "else if (!mcountinhibit[0])      cycle_ctr <= cycle_ctr + 64'd1;",
      "else                             cycle_ctr <= cycle_ctr + 64'd1;"),

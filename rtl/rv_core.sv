@@ -133,6 +133,8 @@ module rv_core #(
     logic [4:0]  rs2;
     logic [31:0] rs1_val;
     logic [31:0] rs2_val;
+    logic        fwd1_mem, fwd1_wb;   // forwarding selects, decided in ID
+    logic        fwd2_mem, fwd2_wb;
     logic [31:0] imm;
     logic        pred_taken;   // decode predicted taken and already redirected
     logic [BHT_BITS-1:0] bht_idx;  // table entry used for the prediction
@@ -188,7 +190,8 @@ module rv_core #(
   // instruction cache is treated exactly like no fetch at all. A fetch from
   // outside RAM doesn't look in memory at all: it becomes a NOP carrying an
   // access fault, which is raised when it reaches EX.
-  wire        fetch_fault = (pc_d >= 32'(RAM_BYTES));
+  localparam int RAM_BITS = $clog2(RAM_BYTES);       // RAM_BYTES is a power of two
+  wire        fetch_fault = (pc_d[31:RAM_BITS] != '0);
   wire        fetch_miss  = valid_d && !imem_valid && !fetch_fault;
   wire        valid_i = valid_d && !fetch_miss;
   wire [31:0] instr_d = (valid_i && !fetch_fault) ? imem_rdata : INSTR_NOP;
@@ -207,6 +210,23 @@ module rv_core #(
 
   ctrl_t       c_d;
   logic [31:0] imm_d;
+
+  // Which CSRs exist (see the CSR file below), and whether this access may
+  // write it: decided in decode from the instruction bits alone, so EX only
+  // sees a ready-made illegal-instruction flag.
+  //   mcycle/minstret/mhpmcounterN (0xB0x/0xB8x, not 0xB01/0xB81) and their
+  //   read-only shadows (0xC0x/0xC8x), plus the machine CSRs listed
+  function automatic logic csr_legal(input logic [11:0] n, input logic writes);
+    logic counter = (n[11:8] == 4'hB || n[11:8] == 4'hC) && n[6:5] == 2'b00 &&
+                    (n[4:0] != 5'd1 || n[11:8] == 4'hC);
+    logic known;
+    unique case (n)
+      12'h300, 12'h301, 12'h304, 12'h305, 12'h320, 12'h340, 12'h341, 12'h342, 12'h343, 12'h344,
+      12'hF11, 12'hF12, 12'hF13, 12'hF14, 12'hFC0, 12'hFC1: known = 1'b1;
+      default: known = counter;
+    endcase
+    return known && !(writes && n[11:10] == 2'b11);     // 0xC00-0xFFF are read-only
+  endfunction
 
   always_comb begin
     c_d        = '0;
@@ -282,6 +302,7 @@ module rv_core #(
           // in EX, where the CSR file is.
           c_d.reg_we = 1; c_d.wb_sel = WB_CSR; c_d.is_csr = 1;
           c_d.uses_rs1 = !f3_d[2];
+          c_d.illegal  = !csr_legal(instr_d[31:20], f3_d[1:0] == 2'b01 || rs1_d != 5'd0);
         end
       end
       default: c_d.illegal = 1;
@@ -314,16 +335,22 @@ module rv_core #(
   // Forwarding: youngest producer wins (MEM before WB). A load or multiply in
   // MEM can't forward (its result isn't ready until the end of MEM) - the
   // late-result stall covers it.
-  function automatic logic [31:0] fwd(input logic [4:0] r, input logic [31:0] v);
-    if (r != 5'd0 && mem.valid && mem.reg_we && !mem.is_load && !mem.is_mul && mem.rd == r)
-      return mem.result;
-    if (r != 5'd0 && wb.valid && wb.reg_we && wb.rd == r)
-      return wb.value;
-    return v;
+  //
+  // Which source to take is decided a cycle early, in ID: the instruction
+  // that will be in MEM when this one reaches EX is the one in EX now, and
+  // the one that will be in WB is the one in MEM now. (If the one in EX is
+  // squashed by a trap, the one in ID is flushed too, so it doesn't matter.)
+  // EX then only has a 3-way mux in front of the ALU instead of register
+  // number comparisons - this was on the critical path.
+  function automatic logic fwd_from_ex(input logic [4:0] r);
+    return r != 5'd0 && ex.valid && ex.c.reg_we && !ex.c.is_load && !ex.c.is_mul && ex.rd == r;
+  endfunction
+  function automatic logic fwd_from_mem(input logic [4:0] r);
+    return r != 5'd0 && mem.valid && mem.reg_we && mem.rd == r;
   endfunction
 
-  wire [31:0] a_fwd = fwd(ex.rs1, ex.rs1_val);
-  wire [31:0] b_fwd = fwd(ex.rs2, ex.rs2_val);
+  wire [31:0] a_fwd = ex.fwd1_mem ? mem.result : ex.fwd1_wb ? wb.value : ex.rs1_val;
+  wire [31:0] b_fwd = ex.fwd2_mem ? mem.result : ex.fwd2_wb ? wb.value : ex.rs2_val;
 
   wire [31:0] op_a = (ex.c.a_sel == A_PC)   ? ex.pc :
                      (ex.c.a_sel == A_ZERO) ? 32'b0 : a_fwd;
@@ -352,9 +379,9 @@ module rv_core #(
   // mepc). A trap redirects to the trap vector and overrides everything: the
   // instruction in EX doesn't execute (ex_live is low).
   wire ex_live       = ex.valid && !trap_take;
-  wire br_mispredict = ex_live && ex.c.is_branch && (br_cond != ex.pred_taken);
+  wire br_mispredict = ex_live_nls && ex.c.is_branch && (br_cond != ex.pred_taken);
   wire [31:0] jalr_actual = (a_fwd + ex.imm) & ~32'd1;
-  wire jmp_redirect  = ex_live && ((ex.c.is_jal && !EARLY_JAL) ||
+  wire jmp_redirect  = ex_live_nls && ((ex.c.is_jal && !EARLY_JAL) ||
                                    (ex.c.is_jalr && !(ex.jalr_pred && ex.jalr_target == jalr_actual)) ||
                                    ex.c.is_mret);
   wire redirect_ex   = br_mispredict || jmp_redirect || trap_take;
@@ -371,7 +398,7 @@ module rv_core #(
   // Remember the real target of JALRs the return-address stack didn't predict
   wire [IB_IW-1:0] ib_idx_e = (IBTB_BITS > 0) ? IB_IW'(ex.pc[IBTB_BITS+1:2]) : '0;
   always_ff @(posedge clk) begin
-    if (IBTB_BITS > 0 && !rst && ex_live && ex.c.is_jalr && !ex.ras_popped) begin
+    if (IBTB_BITS > 0 && !rst && ex_live_nls && ex.c.is_jalr && !ex.ras_popped) begin
       ib_valid[ib_idx_e]  <= 1'b1;
       ib_tag[ib_idx_e]    <= ex.pc[31:IBTB_BITS+2];
       ib_target[ib_idx_e] <= jalr_actual;
@@ -382,7 +409,7 @@ module rv_core #(
   always_ff @(posedge clk) begin
     if (rst) begin
       ghr <= '0;
-    end else if (BPRED >= 2 && ex_live && ex.c.is_branch) begin
+    end else if (BPRED >= 2 && ex_live_nls && ex.c.is_branch) begin
       if (br_cond && bht[ex.bht_idx] != 2'b11)       bht[ex.bht_idx] <= bht[ex.bht_idx] + 2'd1;
       else if (!br_cond && bht[ex.bht_idx] != 2'b00) bht[ex.bht_idx] <= bht[ex.bht_idx] - 2'd1;
       ghr <= {ghr[GHR_BITS-2:0], br_cond};
@@ -422,9 +449,9 @@ module rv_core #(
   // behind it.
   assign perf_ev[0] = valid_i && load_use && !redirect_ex && !ex_stall;
   assign perf_ev[1] = redirect_ex;
-  assign perf_ev[2] = ex_live && ex.c.is_branch;
-  assign perf_ev[3] = ex_live && ex.c.is_branch && br_cond;
-  assign perf_ev[4] = ex_live && (ex.c.is_jal || ex.c.is_jalr || ex.c.is_mret);
+  assign perf_ev[2] = ex_live_nls && ex.c.is_branch;
+  assign perf_ev[3] = ex_live_nls && ex.c.is_branch && br_cond;
+  assign perf_ev[4] = ex_live_nls && (ex.c.is_jal || ex.c.is_jalr || ex.c.is_mret);
   assign perf_ev[5] = br_mispredict;
   assign perf_ev[6] = jmp_redirect;
   assign perf_ev[7] = valid_i && mul_use && !redirect_ex && !ex_stall;
@@ -448,6 +475,20 @@ module rv_core #(
   logic [NHPM-1:0] perf_ev_q;
   always_ff @(posedge clk) perf_ev_q <= rst ? '0 : perf_ev;
   wire  [NHPM-1:0] perf_cnt = (perf_ev & ~EV_LATE) | (perf_ev_q & EV_LATE);
+
+  // The event counters add their events one cycle later still, from
+  // registers (events and the inhibit bits alike, so a measurement window is
+  // unchanged, just shifted). Events are decided late in EX, and the
+  // increment of a 64-bit counter is long; registering in between keeps the
+  // two out of the same clock cycle. A counter read sees its value as of two
+  // cycles earlier, so a measurement that freezes the counters should read
+  // them at least one instruction after the freeze (perftest's snapshot code
+  // reads mcycle first).
+  logic [NHPM-1:0] perf_cnt_q, hpm_inh_q;
+  always_ff @(posedge clk) begin
+    perf_cnt_q <= rst ? '0 : perf_cnt;
+    hpm_inh_q  <= rst ? '0 : mcountinhibit[3 +: NHPM];
+  end
 
   // Read-only configuration register in the custom machine CSR space, so
   // software (tests, benchmarks) can tell which features this build has.
@@ -488,20 +529,7 @@ module rv_core #(
   wire  [31:0] mstatus = {19'b0, 2'b11, 3'b0, mst_mpie, 3'b0, mst_mie, 3'b0};
 
   wire [11:0] csr_addr = ex.instr[31:20];
-  // mcycle/minstret/mhpmcounterN (0xB0x/0xB8x, not 0xB01/0xB81) and their
-  // read-only shadows (0xC0x/0xC8x)
-  wire csr_counter = (csr_addr[11:8] == 4'hB || csr_addr[11:8] == 4'hC) && csr_addr[6:5] == 2'b00 &&
-                     (csr_addr[4:0] != 5'd1 || csr_addr[11:8] == 4'hC);
-  logic csr_known;
-  always_comb begin
-    unique case (csr_addr)
-      12'h300, 12'h301, 12'h304, 12'h305, 12'h320, 12'h340, 12'h341, 12'h342, 12'h343, 12'h344,
-      12'hF11, 12'hF12, 12'hF13, 12'hF14, CSR_MCONFIG, CSR_MCACHE: csr_known = 1'b1;
-      default: csr_known = csr_counter;
-    endcase
-  end
   wire csr_writes  = ex.c.is_csr && (f3_e[1:0] == 2'b01 || ex.rs1 != 5'd0);
-  wire csr_illegal = ex.c.is_csr && (!csr_known || (csr_writes && csr_addr[11:10] == 2'b11));
 
   logic [31:0] csr_val;
   always_comb begin
@@ -545,7 +573,7 @@ module rv_core #(
       default: csr_new = csr_val & ~csr_src;
     endcase
   end
-  wire csr_we = ex_live && csr_writes;
+  wire csr_we = ex_live_nls && csr_writes;
   function automatic logic csr_wr(input logic [11:0] n);
     return csr_we && csr_addr == n;
   endfunction
@@ -554,10 +582,14 @@ module rv_core #(
   // Exceptions of the instruction in EX, in priority order
   // -------------------------------------------------------------------------
   wire        is_ls  = ex.c.is_load || ex.c.is_store;
-  wire [31:0] ls_addr = alu_y;
+  // Load/store address: its own adder rather than the ALU output, which comes
+  // through the shifter and the result mux. The address feeds the memory, the
+  // alignment/access-fault checks and from those the trap redirect, so it
+  // needs to be early.
+  wire [31:0] ls_addr = a_fwd + ex.imm;
   wire ls_misaligned = (f3_e[1:0] == 2'b01 && ls_addr[0]) ||          // half
                        (f3_e[1:0] == 2'b10 && ls_addr[1:0] != 2'b00);  // word
-  wire ls_mapped     = (ls_addr < 32'(RAM_BYTES)) ||
+  wire ls_mapped     = (ls_addr[31:RAM_BITS] == '0) ||
                        (ls_addr[31:16] == CLINT_BASE[31:16]) ||
                        (ls_addr[31:8]  == IO_BASE[31:8]);
   // There are no compressed instructions, so a jump or taken branch to an
@@ -572,7 +604,7 @@ module rv_core #(
     exc = 1'b1;
     exc_tval = 32'b0;
     if (ex.c.fetch_fault)                begin exc_cause = 32'd1;  exc_tval = ex.pc; end
-    else if (ex.c.illegal || csr_illegal) begin exc_cause = 32'd2;  exc_tval = ex.instr; end
+    else if (ex.c.illegal)               begin exc_cause = 32'd2;  exc_tval = ex.instr; end
     else if (ex.c.is_ecall)                    exc_cause = 32'd11;
     else if (ex.c.is_ebreak)             begin exc_cause = 32'd3;  exc_tval = ex.pc; end
     else if (jump_misaligned)            begin exc_cause = 32'd0;  exc_tval = jump_target; end
@@ -589,7 +621,23 @@ module rv_core #(
   wire irq_take = ex.valid && mst_mie && (irq_pend != 32'b0) &&
                   !is_ls && !ex.c.is_div;
 
-  wire        trap_take   = irq_take || (ex.valid && exc);
+  // The same decision, written so each consumer sees only the terms that can
+  // apply to it: whether an instruction traps is known early unless it's a
+  // load or store, whose faults depend on the computed address. A load or
+  // store is never interrupted and never has a misaligned jump target, and
+  // nothing else can have a load/store fault, so
+  //   ex_live_nls: the instruction in EX executes - if it isn't a load/store
+  //   ls_live:     the instruction in EX executes - if it is one (ignoring
+  //                access faults: an address outside the memory map selects
+  //                no device, so the access does nothing anyway)
+  // Using these instead of !trap_take keeps the address comparison out of the
+  // branch, CSR, divider and memory-enable logic (it was the critical path).
+  wire exc_static  = ex.c.fetch_fault || ex.c.illegal || ex.c.is_ecall || ex.c.is_ebreak;
+  wire exc_ls      = is_ls && (ls_misaligned || !ls_mapped);
+  wire ex_live_nls = ex.valid && !irq_take && !exc_static && !jump_misaligned;
+  wire ls_live     = ex.valid && is_ls && !exc_static && !ls_misaligned;
+
+  wire        trap_take   = irq_take || (ex.valid && (exc_static || jump_misaligned || exc_ls));
   wire [31:0] trap_cause  = irq_take ? {1'b1, 26'b0, irq_code} : exc_cause;
   wire [31:0] trap_tval   = irq_take ? 32'b0 : exc_tval;
   // Vectored mode sends interrupts to BASE + 4 * cause
@@ -623,11 +671,12 @@ module rv_core #(
   // -------------------------------------------------------------------------
   logic        div_issued, div_busy, div_done;
   logic [31:0] div_result;
-  wire div_pending = (M_EXT >= 2) && ex_live && ex.c.is_div;
+  // (a divide can neither fault nor be interrupted)
+  wire div_pending = (M_EXT >= 2) && ex.valid && ex.c.is_div;
   wire div_start   = div_pending && !div_issued;
   wire div_stall   = div_pending && !(div_issued && div_done);
   // A load or store in EX that misses in the data cache waits there too
-  wire mem_stall   = ex_live && is_ls && dmem_stall;
+  wire mem_stall   = ls_live && dmem_stall;
   wire ex_stall    = div_stall || mem_stall;
 
   generate
@@ -650,13 +699,13 @@ module rv_core #(
   endgenerate
 
   // Data memory request (address = ALU result for loads/stores)
-  wire [1:0] byte_off = alu_y[1:0];
+  wire [1:0] byte_off = ls_addr[1:0];
   always_comb begin
-    dmem_addr  = {alu_y[31:2], 2'b00};
-    dmem_re    = ex_live && ex.c.is_load;      // a faulting access never reaches memory
+    dmem_addr  = {ls_addr[31:2], 2'b00};
+    dmem_re    = ls_live && ex.c.is_load;      // a faulting access never reaches memory
     dmem_wdata = b_fwd << {byte_off, 3'b000};
     dmem_we    = 4'b0000;
-    if (ex_live && ex.c.is_store) begin
+    if (ls_live && ex.c.is_store) begin
       unique case (f3_e[1:0])
         2'b00:   dmem_we = 4'b0001 << byte_off;
         2'b01:   dmem_we = 4'b0011 << byte_off;
@@ -838,7 +887,7 @@ module rv_core #(
       for (int k = 0; k < NHPM; k++) begin
         if (csr_wr(12'hB03 + k[11:0]))      hpm[k] <= {hpm[k][63:32], csr_new};
         else if (csr_wr(12'hB83 + k[11:0])) hpm[k] <= {csr_new, hpm[k][31:0]};
-        else if (perf_cnt[k] && !mcountinhibit[3 + k]) hpm[k] <= hpm[k] + 64'd1;
+        else if (perf_cnt_q[k] && !hpm_inh_q[k]) hpm[k] <= hpm[k] + 64'd1;
       end
 
       // Trap entry, MRET, CSR writes (all from EX)
@@ -848,7 +897,7 @@ module rv_core #(
         mtval    <= trap_tval;
         mst_mpie <= mst_mie;
         mst_mie  <= 1'b0;
-      end else if (ex_live && ex.c.is_mret) begin
+      end else if (ex_live_nls && ex.c.is_mret) begin
         mst_mie  <= mst_mpie;
         mst_mpie <= 1'b1;
       end else if (csr_we) begin
@@ -887,8 +936,13 @@ module rv_core #(
         // ID holds too, via stall_d. Keep the operands current: the producers
         // it's forwarding from move on and leave the pipeline while EX waits,
         // after which the stale values read in ID would come back.
-        ex.rs1_val <= a_fwd;
-        ex.rs2_val <= b_fwd;
+        // (the forwarded values are captured now, so stop forwarding)
+        ex.rs1_val  <= a_fwd;
+        ex.rs2_val  <= b_fwd;
+        ex.fwd1_mem <= 1'b0;
+        ex.fwd1_wb  <= 1'b0;
+        ex.fwd2_mem <= 1'b0;
+        ex.fwd2_wb  <= 1'b0;
       end else if (redirect_ex || stall_d || !valid_i) begin
         ex <= '0;  // bubble
       end else begin
@@ -900,6 +954,10 @@ module rv_core #(
         ex.rs2     <= rs2_d;
         ex.rs1_val <= rf_rd1;
         ex.rs2_val <= rf_rd2;
+        ex.fwd1_mem <= fwd_from_ex(rs1_d);
+        ex.fwd1_wb  <= fwd_from_mem(rs1_d);
+        ex.fwd2_mem <= fwd_from_ex(rs2_d);
+        ex.fwd2_wb  <= fwd_from_mem(rs2_d);
         ex.imm        <= imm_d;
         ex.pred_taken <= pred_taken_d;
         ex.bht_idx    <= bht_idx_d;
