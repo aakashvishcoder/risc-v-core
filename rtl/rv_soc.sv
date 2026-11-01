@@ -70,6 +70,7 @@ module rv_soc #(
   logic [31:0] dmem_addr, dmem_wdata, dmem_rdata;
   logic [3:0]  dmem_we;
   logic        dmem_re, dmem_stall;
+  logic        fencei_req, fencei_busy;
   logic        ev_icache_miss, ev_dcache_miss, ev_dcache_wb;
   logic        irq_timer, irq_soft, irq_ext;
 
@@ -81,6 +82,7 @@ module rv_soc #(
     .clk, .rst,
     .imem_addr, .imem_rdata, .imem_pc, .imem_valid, .imem_lookup, .imem_kill,
     .dmem_addr, .dmem_wdata, .dmem_we, .dmem_re, .dmem_rdata, .dmem_stall,
+    .fencei_req, .fencei_busy,
     .ev_icache_miss, .ev_dcache_miss, .ev_dcache_wb,
     .irq_timer, .irq_soft, .irq_ext,
     .commit_valid, .commit_pc, .commit_instr,
@@ -109,6 +111,7 @@ module rv_soc #(
       );
       assign imem_valid     = 1'b1;
       assign dmem_stall     = 1'b0;
+      assign fencei_busy    = 1'b0;     // one memory: fetch already sees every store
       assign ev_icache_miss = 1'b0;
       assign ev_dcache_miss = 1'b0;
       assign ev_dcache_wb   = 1'b0;
@@ -120,6 +123,10 @@ module rv_soc #(
       logic [31:0]  ic_addr, d_addr, mm_addr;
       logic [15:0]  d_wstrb;
       logic [127:0] d_wdata, mm_rdata;
+      logic         ic_busy, dc_flush_busy;
+      // FENCE.I: write the data cache back, and let any instruction fill in
+      // flight land before the instruction cache is invalidated
+      assign fencei_busy = fencei_req && (dc_flush_busy || ic_busy);
 
       rv_icache #(.LINES(IC_LINES)) u_icache (
         .clk, .rst,
@@ -133,7 +140,9 @@ module rv_soc #(
         .mem_addr   (ic_addr),
         .mem_done   (mm_done && owner_d == 1'b0),
         .mem_rdata  (mm_rdata),
-        .miss_ev    (ev_icache_miss)
+        .miss_ev    (ev_icache_miss),
+        .flush      (fencei_req && !fencei_busy),   // the cycle FENCE.I completes
+        .busy       (ic_busy)
       );
 
       if (DC_SETS > 0) begin : g_dcache
@@ -146,6 +155,8 @@ module rv_soc #(
           .wdata     (dmem_wdata),
           .stall     (dmem_stall),
           .rdata     (ram_rdata),
+          .flush     (fencei_req),
+          .flush_busy(dc_flush_busy),
           .mem_req   (d_req),
           .mem_we    (d_we),
           .mem_addr  (d_addr),
@@ -174,6 +185,7 @@ module rv_soc #(
           end
         end
         assign dmem_stall     = ram_acc && !d_done_q;
+        assign dc_flush_busy  = 1'b0;   // nothing cached on the data side
         assign ram_rdata      = d_word_q;
         assign ev_dcache_miss = 1'b0;
         assign ev_dcache_wb   = 1'b0;
