@@ -51,7 +51,7 @@ sched: all tasks done after 429 context switches
 - [x] M extension: pipelined multiplier, iterative divider
 - [x] Instruction cache and 2-way write-back data cache in front of a slow main memory
 - [x] Precise machine-mode exceptions, full CSR file, CLINT timer/software/external interrupts
-- [ ] FPGA synthesis and timing (Fmax, resource use)
+- [x] FPGA synthesis, place and route for the XC7A35T (open-source flow): 62 MHz, 22% of the LUTs
 - [ ] Official RISC-V architecture compliance tests
 - [ ] FPGA bring-up on the carrier board
 
@@ -74,6 +74,7 @@ make -C sim                                # build the simulator
 make -C sim run HEX=../sw/build/hello.hex  # run it
 make test                                  # full test suite
 make demo                                  # preemptive scheduler demo
+fpga/build.sh                              # synthesize, place and route for the XC7A35T
 make bench                                 # CoreMark with a CPI breakdown
 make study                                 # branch predictor what-if study
 make cache-study                           # cache what-if study
@@ -631,6 +632,66 @@ All prediction happens in decode, and all of it is checked in execute.
   (x1/x5): calls push, returns pop, and a `jalr` that is both pops then
   pushes. It's a circular buffer, so recursion deeper than 8 just
   mispredicts.
+
+## FPGA implementation
+
+`fpga/build.sh` takes the SoC as it will sit on the carrier board (`fpga/fpga_top.sv`:
+single-cycle 64 KB block RAM, UART, LEDs, CLINT) through a fully open-source
+flow for the board's XC7A35T-FGG484-1: sv2v, yosys `synth_xilinx`, and
+nextpnr-xilinx with the Project X-Ray timing database. That's synthesis,
+placement, routing and timing analysis, with no Vivado.
+
+| Resource | Used | XC7A35T | |
+|---|---|---|---|
+| LUTs (logic) | 4,442 | 20,800 | 21% |
+| LUTs as distributed RAM | 152 | | register file, predictor tables |
+| Flip-flops | 2,027 | 41,600 | 5% |
+| Block RAM (RAMB36) | 16 | 50 | 64 KB of program/data memory |
+| DSP48 | 4 | 90 | the 33×33 multiplier |
+
+The core itself is about 3,500 LUTs. The divider adds 240 and the CLINT
+200. Almost half the flip-flops are the 64-bit performance counters.
+
+**Timing.** The board's oscillator is 50 MHz. The first routed build
+reached only **36 MHz** (median of 5 placement seeds). Each critical path
+report showed one long chain of logic, and fixing them one at a time took
+it to **62 MHz** (median; 48-66 MHz across seeds), 1.7× faster. None of
+the fixes costs a single cycle: CPI and CoreMark/MHz are unchanged, and
+every test and all 59 mutants pass.
+
+1. **Counter increments were in the same cycle as the trap decision.**
+   Every event (a branch, a stall, a trap) is decided late in EX and was
+   added straight into a 64-bit counter. The events and the inhibit bits
+   are now registered first. A measurement window just shifts by a cycle.
+2. **"Does this instruction execute?" was one signal for everything.** A
+   load or store's fault (misaligned, or outside the memory map) depends on
+   its computed address, and that slow signal gated the branch redirect,
+   the CSR write, the divider start and the memory enables. Now each
+   consumer only sees faults that can apply to it. Loads and stores are
+   never interrupted and never have jump faults, and nothing else has
+   load/store faults. The memory enables ignore access faults altogether:
+   an address outside the map selects no device, so it does nothing anyway.
+3. **Forwarding compared register numbers in EX.** Which value to forward
+   is now decided in ID, a cycle early, so EX only has a 3-way mux in front
+   of the ALU. The instruction that will be in MEM is the one in EX now,
+   and the one that will be in WB is the one in MEM now.
+4. **Load/store addresses came out of the ALU**, through the shifter and
+   the result mux. They now have their own adder, an address generation
+   unit.
+5. **CSR legality was decoded in EX.** Whether a CSR exists, or is
+   read-only, depends only on the instruction bits, so decode now folds it
+   into the illegal-instruction flag.
+
+What's left on the critical path is the classic one: a forwarded operand
+goes into the branch comparator, then the misprediction decision, then
+the next fetch address into the block RAM. That loop is what decides how
+far a 5-stage pipeline with single-cycle branch resolution can be clocked.
+
+At the board's 50 MHz the core scores about 119 CoreMark (2.37
+CoreMark/MHz). These numbers come from nextpnr-xilinx's timing model,
+which is generally more pessimistic than Vivado. The pin locations in
+`fpga/fpga_top.xdc` are placeholders until the board's pinout is wired up
+at bring-up, but timing doesn't depend on them.
 
 ## Pipeline
 
