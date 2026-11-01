@@ -23,10 +23,11 @@ IC_LINES    ?= 128
 DC_SETS     ?= 64
 DC_WAYS     ?= 2
 MEM_LATENCY ?= 20
+MEM_WORDS   ?= 16384
 PARAMS = -GEARLY_JAL=$(EARLY_JAL) -GBPRED=$(BPRED) -GBHT_BITS=$(BHT_BITS) -GGHR_BITS=$(GHR_BITS) \
          -GRAS_DEPTH=$(RAS_DEPTH) -GIBTB_BITS=$(IBTB_BITS) -GM_EXT=$(M_EXT) \
          -GCACHES=$(CACHES) -GIC_LINES=$(IC_LINES) -GDC_SETS=$(DC_SETS) -GDC_WAYS=$(DC_WAYS) \
-         -GMEM_LATENCY=$(MEM_LATENCY)
+         -GMEM_LATENCY=$(MEM_LATENCY) -GMEM_WORDS=$(MEM_WORDS)
 VFLAGS = --cc --exe --build -j 0 -O3 --trace -Wall -Wno-fatal \
          -Wno-UNUSEDSIGNAL -Wno-UNUSEDPARAM \
          -I$(RTL_DIR) +define+SIMULATION --top-module rv_soc \

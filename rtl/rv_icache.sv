@@ -11,6 +11,8 @@
 // While a fill is in flight, other lookups can still hit (hit under miss); a
 // second miss waits for the fill to finish. A miss on a fetch the core is
 // about to throw away (kill: EX is redirecting) doesn't start a fill.
+// flush (FENCE.I) invalidates every line in one cycle; the SoC only issues it
+// when no fill is in flight (busy low), so no stale line can arrive after.
 // ---------------------------------------------------------------------------
 module rv_icache #(
   parameter int LINES = 64                  // 64 x 16 B = 1 KiB
@@ -29,7 +31,9 @@ module rv_icache #(
   input  logic         mem_done,
   input  logic [127:0] mem_rdata,
 
-  output logic         miss_ev              // one pulse per miss (performance counter)
+  output logic         miss_ev,             // one pulse per miss (performance counter)
+  input  logic         flush,
+  output logic         busy                 // a fill is in flight
 );
   localparam int IB = $clog2(LINES);
   localparam int TW = 32 - 4 - IB;
@@ -66,7 +70,7 @@ module rv_icache #(
 
   // Valid bits: cleared on reset
   always_ff @(posedge clk) begin
-    if (rst) begin
+    if (rst || flush) begin
       valid   <= '0;
       valid_q <= 1'b0;
     end else begin
@@ -94,4 +98,5 @@ module rv_icache #(
   assign mem_req  = filling;
   assign mem_addr = fill_addr;
   assign miss_ev  = start_fill;
+  assign busy     = filling;
 endmodule

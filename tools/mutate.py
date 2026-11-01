@@ -230,6 +230,15 @@ MUTANTS = [
     ("timer interrupt only on mtime == mtimecmp", "rv_clint.sv",
      "assign irq_timer = (mtime >= mtimecmp);",
      "assign irq_timer = (mtime == mtimecmp);"),
+    ("FENCE.I doesn't write back the data cache", "rv_dcache.sv",
+     "if (valid[fway][fidx] && dirty[fway][fidx]) state <= FWB;",
+     "if (1'b0) state <= FWB;", CACHED),
+    ("FENCE.I doesn't invalidate the instruction cache", "rv_icache.sv",
+     "    if (rst || flush) begin",
+     "    if (rst) begin", CACHED),
+    ("FENCE.I doesn't refetch the instructions after it", "rv_core.sv",
+     "ex.c.is_mret || (ex.c.is_fencei && !fencei_busy));",
+     "ex.c.is_mret);"),
     ("load-use also counted during a cache stall", "rv_core.sv",
      "assign perf_ev[0] = valid_i && load_use && !redirect_ex && !ex_stall;",
      "assign perf_ev[0] = valid_i && load_use && !redirect_ex;", CACHED),
@@ -253,7 +262,8 @@ def main():
     args = ap.parse_args()
 
     env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1")
-    for prog in ("perftest", "mext", "cachetest", "coldload", "traptest", "irqtest", "sched"):
+    for prog in ("perftest", "mext", "cachetest", "coldload", "traptest", "irqtest", "sched",
+                 "fencei"):
         if run(f"make -s -C {ROOT}/sw PROG={prog}").returncode != 0:
             sys.exit(f"could not build {prog}")
     perftest = f"{ROOT}/sw/build/perftest.hex"
@@ -302,7 +312,8 @@ def main():
             summary = r.stdout.strip().splitlines()[-1]
             tfailed = int(summary.split(",")[1].split()[0])
             trap_fail = tfailed > 0
-            for prog, limit in (("traptest", 5000000), ("irqtest", 5000000), ("sched", 10000000)):
+            for prog, limit in (("traptest", 5000000), ("irqtest", 5000000), ("sched", 10000000),
+                                ("fencei", 1000000)):
                 t = run(f"{obj}/Vrv_soc +firmware={ROOT}/sw/build/{prog}.hex +max_cycles={limit}")
                 trap_fail |= t.returncode != 0 or f"{prog}: 0 failures" not in t.stdout
             dead = failed > 0 or perf_fail or mext_fail or cache_fail or trap_fail

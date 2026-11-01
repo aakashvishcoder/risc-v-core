@@ -16,6 +16,11 @@
 //               and hits.
 // The access can't change while it waits (EX is held), so the victim's data
 // and address stay put for the writeback.
+//
+// flush (FENCE.I): walk every line and write the dirty ones back, so main
+// memory - where instruction fetch reads from - holds every earlier store.
+// Lines stay valid (and become clean). flush_busy is high until the walk is
+// done; the request must then drop before another flush can start.
 // ---------------------------------------------------------------------------
 module rv_dcache #(
   parameter int SETS = 64,                  // 64 sets
@@ -30,6 +35,8 @@ module rv_dcache #(
   input  logic [31:0]  wdata,               // already shifted into its byte lanes
   output logic         stall,
   output logic [31:0]  rdata,               // load word, in MEM (cycle after EX)
+  input  logic         flush,               // FENCE.I in EX
+  output logic         flush_busy,
   // Main memory side
   output logic         mem_req,
   output logic         mem_we,
@@ -52,7 +59,13 @@ module rv_dcache #(
   logic [SETS-1:0] dirty [WAYS];
   logic [SETS-1:0] lru;                     // way to replace next (2 ways)
 
-  wire [IB-1:0] idx = addr[IB+3:4];
+  typedef enum logic [2:0] {IDLE, WRITEBACK, FILL, FSCAN, FWB, FDONE} state_t;
+  state_t        state;
+  logic [IB-1:0]  fidx;                     // flush walk position
+  logic [WB_-1:0] fway;
+  wire  walking = (state == FSCAN) || (state == FWB);
+
+  wire [IB-1:0] idx = walking ? fidx : addr[IB+3:4];
   wire [TW-1:0] tag = addr[31:IB+4];
 
   // Lookup
@@ -71,8 +84,6 @@ module rv_dcache #(
     end
   end
 
-  typedef enum logic [1:0] {IDLE, WRITEBACK, FILL} state_t;
-  state_t        state;
   logic [WB_-1:0] victim;                   // way chosen when the miss started
   wire  [WB_-1:0] lru_way = (WAYS > 1) ? WB_'(lru[idx]) : '0;
 
@@ -115,6 +126,10 @@ module rv_dcache #(
         IDLE:      if (req && !hit) begin
                      victim <= lru_way;
                      state  <= (valid[lru_way][idx] && dirty[lru_way][idx]) ? WRITEBACK : FILL;
+                   end else if (flush) begin
+                     fidx  <= '0;
+                     fway  <= '0;
+                     state <= FSCAN;
                    end
         WRITEBACK: if (mem_done) state <= FILL;
         FILL:      if (mem_done) begin
@@ -123,6 +138,22 @@ module rv_dcache #(
                      valid[victim][idx] <= 1'b1;
                      dirty[victim][idx] <= 1'b0;
                    end
+        // Flush walk: one cycle per line (the data read for the writeback
+        // happens in that cycle), plus the writeback for a dirty one
+        FSCAN:     if (valid[fway][fidx] && dirty[fway][fidx]) state <= FWB;
+                   else if (fway == WB_'(WAYS - 1) && fidx == IB'(SETS - 1)) state <= FDONE;
+                   else if (fway == WB_'(WAYS - 1)) begin fway <= '0; fidx <= fidx + 1'b1; end
+                   else fway <= fway + 1'b1;
+        FWB:       if (mem_done) begin
+                     dirty[fway][fidx] <= 1'b0;
+                     if (fway == WB_'(WAYS - 1) && fidx == IB'(SETS - 1)) state <= FDONE;
+                     else begin
+                       state <= FSCAN;
+                       if (fway == WB_'(WAYS - 1)) begin fway <= '0; fidx <= fidx + 1'b1; end
+                       else fway <= fway + 1'b1;
+                     end
+                   end
+        FDONE:     if (!flush) state <= IDLE;
         default:   state <= IDLE;
       endcase
       if (store_hit) dirty[hit_way][idx] <= 1'b1;
@@ -131,10 +162,13 @@ module rv_dcache #(
     end
   end
 
-  assign mem_req   = (state == WRITEBACK) || (state == FILL);
-  assign mem_we    = (state == WRITEBACK);
-  assign mem_addr  = (state == WRITEBACK) ? {tags[victim][idx], idx, 4'b0} : {addr[31:4], 4'b0};
-  assign mem_wdata = data_q[victim];        // the victim line, read while EX waits
+  assign mem_req   = (state == WRITEBACK) || (state == FILL) || (state == FWB);
+  assign mem_we    = (state == WRITEBACK) || (state == FWB);
+  assign mem_addr  = (state == WRITEBACK) ? {tags[victim][idx], idx, 4'b0} :
+                     (state == FWB)       ? {tags[fway][fidx], fidx, 4'b0} : {addr[31:4], 4'b0};
+  // the line being written back, read while EX waits
+  assign mem_wdata = data_q[(state == FWB) ? fway : victim];
+  assign flush_busy = flush && (state != FDONE);
 
   assign miss_ev = (state == IDLE) && req && !hit;
   assign wb_ev   = miss_ev && valid[lru_way][idx] && dirty[lru_way][idx];

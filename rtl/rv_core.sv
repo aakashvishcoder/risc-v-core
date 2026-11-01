@@ -76,6 +76,12 @@ module rv_core #(
   input  logic [31:0] dmem_rdata,
   input  logic        dmem_stall,   // the access in EX must wait (D-cache miss)
 
+  // FENCE.I: while it's in EX, the memory system makes instruction fetch see
+  // every earlier store (writes back the data cache, invalidates the
+  // instruction cache); EX waits while it's busy
+  output logic        fencei_req,
+  input  logic        fencei_busy,
+
   // Interrupt lines (level-sensitive): machine timer, software, external
   input  logic        irq_timer,
   input  logic        irq_soft,
@@ -120,6 +126,7 @@ module rv_core #(
     logic       is_ecall;
     logic       is_ebreak;
     logic       is_mret;
+    logic       is_fencei;
     logic       illegal;      // not a valid RV32IM/Zicsr instruction
     logic       fetch_fault;  // fetched from outside RAM
   } ctrl_t;
@@ -284,7 +291,9 @@ module rv_core #(
                           (f7_d == 7'b0100000 && (f3_d == 3'b000 || f3_d == 3'b101)));
         end
       end
-      OP_FENCE: ; // no caches or reordering: NOP
+      // FENCE: loads and stores already happen in order, so a NOP. FENCE.I
+      // (Zifencei) flushes the pipeline and the memory system (see EX).
+      OP_FENCE: c_d.is_fencei = (f3_d == 3'b001);
       OP_SYSTEM: begin
         if (f3_d == 3'b000) begin
           unique case (instr_d)
@@ -381,15 +390,18 @@ module rv_core #(
   wire ex_live       = ex.valid && !trap_take;
   wire br_mispredict = ex_live_nls && ex.c.is_branch && (br_cond != ex.pred_taken);
   wire [31:0] jalr_actual = (a_fwd + ex.imm) & ~32'd1;
+  // FENCE.I redirects to pc + 4 once the memory system is done, so the
+  // instructions after it are fetched again, after the stores before it.
   wire jmp_redirect  = ex_live_nls && ((ex.c.is_jal && !EARLY_JAL) ||
                                    (ex.c.is_jalr && !(ex.jalr_pred && ex.jalr_target == jalr_actual)) ||
-                                   ex.c.is_mret);
+                                   ex.c.is_mret || (ex.c.is_fencei && !fencei_busy));
   wire redirect_ex   = br_mispredict || jmp_redirect || trap_take;
 
   logic [31:0] target_ex;
   always_comb begin
     if (trap_take)                        target_ex = trap_vector;
     else if (ex.c.is_mret)                target_ex = mepc;
+    else if (ex.c.is_fencei)              target_ex = ex.pc + 32'd4;
     else if (ex.c.is_jalr)                target_ex = jalr_actual;
     else if (ex.c.is_branch && !br_cond)  target_ex = ex.pc + 32'd4;  // predicted taken, wasn't
     else                                  target_ex = ex.pc + ex.imm;
@@ -426,11 +438,12 @@ module rv_core #(
   //   7  jumps                     JAL + JALR + MRET
   //   8  branch mispredictions     (redirects caused by a conditional branch)
   //   9  jump redirects from EX    (jumps not followed in decode, or followed
-  //                                 to the wrong target)
+  //                                 to the wrong target; MRET, FENCE.I)
   //  10  multiply-use stall cycles ID held because EX has a multiply it depends on
   //  11  divider stall cycles      EX busy with a divide
   //  12  I-cache stall cycles      ID empty because its fetch missed
-  //  13  D-cache stall cycles      EX waiting for a data-cache miss
+  //  13  D-cache stall cycles      EX waiting for a data-cache miss (or for
+  //                                 the caches to flush for a FENCE.I)
   //  14  I-cache misses
   //  15  D-cache misses
   //  16  D-cache dirty writebacks
@@ -457,7 +470,7 @@ module rv_core #(
   assign perf_ev[7] = valid_i && mul_use && !redirect_ex && !ex_stall;
   assign perf_ev[8]  = div_stall;
   assign perf_ev[9]  = fetch_miss && !redirect_ex && !ex_stall;
-  assign perf_ev[10] = mem_stall;
+  assign perf_ev[10] = mem_stall || fencei_stall;
   assign perf_ev[11] = ev_icache_miss;
   assign perf_ev[12] = ev_dcache_miss;
   assign perf_ev[13] = ev_dcache_wb;
@@ -619,7 +632,7 @@ module rv_core #(
   wire [31:0] irq_pend = mip & mie_r;
   wire [4:0]  irq_code = irq_pend[11] ? 5'd11 : irq_pend[3] ? 5'd3 : 5'd7;
   wire irq_take = ex.valid && mst_mie && (irq_pend != 32'b0) &&
-                  !is_ls && !ex.c.is_div;
+                  !is_ls && !ex.c.is_div && !ex.c.is_fencei;
 
   // The same decision, written so each consumer sees only the terms that can
   // apply to it: whether an instruction traps is known early unless it's a
@@ -677,7 +690,10 @@ module rv_core #(
   wire div_stall   = div_pending && !(div_issued && div_done);
   // A load or store in EX that misses in the data cache waits there too
   wire mem_stall   = ls_live && dmem_stall;
-  wire ex_stall    = div_stall || mem_stall;
+  // ... and so does a FENCE.I while the caches flush (never interrupted)
+  assign fencei_req  = ex.valid && ex.c.is_fencei;
+  wire fencei_stall  = fencei_req && fencei_busy;
+  wire ex_stall      = div_stall || mem_stall || fencei_stall;
 
   generate
     if (M_EXT >= 2) begin : g_div

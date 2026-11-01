@@ -12,7 +12,7 @@ SEEDS ?= 100
 SHELL := /bin/bash
 .SHELLFLAGS := -o pipefail -c
 
-.PHONY: sim-cache test test-quick test-configs bench-configs mutate demo bench study cache-study sim hello progs clean
+.PHONY: sim-cache test test-quick test-configs bench-configs mutate demo compliance bench study cache-study sim hello progs clean
 
 sim:
 	$(MAKE) -s -C sim
@@ -20,7 +20,7 @@ sim:
 hello:
 	$(MAKE) -s -C sw PROG=hello
 
-PROGS = hello perftest mext cachetest coldload memstream traptest irqtest sched
+PROGS = hello perftest mext cachetest coldload memstream traptest irqtest sched fencei
 CACHE_SIM = sim/obj_cache/Vrv_soc
 progs:
 	@for p in $(PROGS); do $(MAKE) -s -C sw PROG=$$p || exit 1; done
@@ -50,6 +50,14 @@ test: sim sim-cache progs
 
 test-quick:
 	@$(MAKE) -s test SEEDS=20
+
+# Official RISC-V architecture tests (riscv-arch-test 2.7.4), on the
+# single-cycle-RAM core and on the cached memory system. Clones the test
+# suite into build/ on first use.
+compliance:
+	@python3 compliance/run.py
+	@$(MAKE) -s -C sim OBJ=obj_act_cache CACHES=1 MEM_WORDS=1048576
+	@python3 compliance/run.py --sim sim/obj_act_cache/Vrv_soc | tail -1
 
 # Preemptive scheduler demo: three tasks time-sliced by the timer interrupt
 demo: sim

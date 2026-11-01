@@ -91,6 +91,7 @@ class Exc(Exception):
 class ISS:
     def __init__(self, image_words, mem_bytes=RAM_SIZE, m_ext=False):
         self.mem = bytearray(mem_bytes)
+        self.ram_size = mem_bytes
         for i, w in enumerate(image_words):
             self.mem[4 * i:4 * i + 4] = w.to_bytes(4, "little")
         self.x = [0] * 32
@@ -110,9 +111,8 @@ class ISS:
         self.log = []        # trap lines produced by the last step()
 
     # ---- memory (mirrors the rv_soc memory map) ---------------------------
-    @staticmethod
-    def region(addr):
-        if addr < RAM_SIZE:
+    def region(self, addr):
+        if addr < self.ram_size:
             return "ram"
         if CLINT_BASE <= addr < CLINT_BASE + CLINT_SIZE:
             return "clint"
@@ -415,9 +415,11 @@ def main():
     ap.add_argument("--sync", "--csr-sync", dest="sync",
                     help="RTL trace to take timing-dependent values and interrupts from")
     ap.add_argument("--mem-trace", help="write every RAM load/store address here")
+    ap.add_argument("--ram-kb", type=int, default=RAM_SIZE // 1024,
+                    help="RAM size (must match the simulator's MEM_WORDS)")
     args = ap.parse_args()
 
-    sim = ISS(read_hex(args.hex), m_ext=args.m)
+    sim = ISS(read_hex(args.hex), mem_bytes=args.ram_kb * 1024, m_ext=args.m)
     if args.sync:
         load_sync(sim, args.sync)
     if args.mem_trace:
